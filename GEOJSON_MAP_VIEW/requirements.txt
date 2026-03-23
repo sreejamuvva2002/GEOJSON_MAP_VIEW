@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+pandas
+duckdb
+sentence-transformers
+faiss-cpu
+streamlit
+pydeck
+geopy
+openai
+openpyxl

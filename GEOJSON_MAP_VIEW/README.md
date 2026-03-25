@@ -55,25 +55,25 @@ ollama serve
 2. Pull a model:
 
 ```bash
-ollama pull qwen3:14b
+ollama pull qwen2.5:14b
 ```
 
 3. (Optional) Set explicit model and endpoint:
 
 ```bash
-set OLLAMA_MODEL=qwen3:14b
-set OLLAMA_BASE_URL=http://127.0.0.1:11434/v1
+export OLLAMA_MODEL=qwen2.5:14b
+export OLLAMA_BASE_URL=http://127.0.0.1:11434/v1
 ```
 
 If `OLLAMA_MODEL` is not set, backend auto-selects the best available pulled model from your local Ollama registry.
 
 ### Suggested Models for This RAG Pipeline
 
-- `qwen3:14b` for best balance of quality and local speed.
+- `qwen2.5:14b` for the best compatibility and answer quality in this project.
 - `gpt-oss:20b` for stronger reasoning quality if hardware allows.
 - `deepseek-r1:14b` if you want stronger deliberate reasoning style.
 
-For very limited hardware, `qwen3:8b` is the practical minimum. Avoid `tinyllama` for production-quality answers.
+For very limited hardware, `llama3.2:3b` is the practical minimum. Some `qwen3` models may return reasoning-only output on Ollama's OpenAI-compatible endpoint, which this app treats as incompatible.
 
 If you set a model that does not fit memory, backend will auto-retry smaller locally available models and return `model_used` in the API response.
 

@@ -75,13 +75,17 @@ class HybridGeospatialRAGPipeline:
         self.llm_model = os.getenv("OLLAMA_MODEL") or self._choose_default_model()
         if not self.llm_model:
             raise RuntimeError(
-                "No Ollama model available. Pull one first (for example: ollama pull qwen3:14b) "
+                "No Ollama model available. Pull one first (for example: ollama pull qwen2.5:14b) "
                 "or set OLLAMA_MODEL explicitly."
             )
         self.fallback_model_preferences = [
+            "qwen2.5:14b",
+            "qwen2.5:7b",
+            "llama3.1:8b",
+            "mistral-small3.2:24b",
+            "gemma3:12b",
             "qwen3:8b",
             "qwen3:4b",
-            "qwen3:1.7b",
             "llama3.2:3b",
             "llama3.2:1b",
             "gemma3:4b",
@@ -194,14 +198,18 @@ class HybridGeospatialRAGPipeline:
 
     def _choose_default_model(self) -> Optional[str]:
         preferred = [
-            "gpt-oss:20b",
+            "qwen2.5:14b",
             "qwen3:14b",
+            "gpt-oss:20b",
+            "mistral-small3.2:24b",
+            "llama3.1:8b",
+            "gemma3:12b",
             "qwen3:8b",
-            "llama3.3:70b",
-            "llama3.3:8b",
             "deepseek-r1:14b",
             "deepseek-r1:8b",
-            "mistral-small3.1:24b",
+            "qwen3:4b",
+            "llama3.2:3b",
+            "gemma3:4b",
             "tinyllama:latest",
         ]
         model_ids = self.available_models
@@ -792,17 +800,29 @@ class HybridGeospatialRAGPipeline:
                     extra_body={"options": {"num_predict": 80, "num_ctx": 1024}},
                 )
                 self.llm_model = model_name
-                content = response.choices[0].message.content if response.choices else None
+                message = response.choices[0].message if response.choices else None
+                content = self._normalize_message_text(getattr(message, "content", None))
                 if not content:
+                    reasoning = self._normalize_message_text(getattr(message, "reasoning", None))
+                    if reasoning:
+                        raise RuntimeError(
+                            f"Ollama returned a reasoning-only response for model '{model_name}'."
+                        )
                     raise RuntimeError(f"Ollama returned an empty response for model '{model_name}'.")
                 return content.strip()
             except Exception as exc:
                 last_exc = exc
-                if self._is_memory_error(exc) or self._is_model_unavailable_error(exc) or self._is_timeout_error(exc):
+                if (
+                    self._is_memory_error(exc)
+                    or self._is_model_unavailable_error(exc)
+                    or self._is_timeout_error(exc)
+                    or self._is_empty_response_error(exc)
+                ):
                     continue
                 raise RuntimeError(
                     f"Ollama LLM call failed for model '{model_name}'. "
-                    f"Verify Ollama is running at {self.llm_base_url}. Error: {exc}"
+                    f"Verify Ollama is running at {self.llm_base_url} and that the selected model "
+                    f"returns assistant content on the OpenAI-compatible chat endpoint. Error: {exc}"
                 ) from exc
 
         return self._fast_fallback_answer(
@@ -835,6 +855,24 @@ class HybridGeospatialRAGPipeline:
         if not match:
             return None
         return float(match.group(1))
+
+    @staticmethod
+    def _normalize_message_text(value: object) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            parts: List[str] = []
+            for item in value:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict) and item.get("type") == "text" and item.get("text"):
+                    parts.append(str(item["text"]))
+                elif hasattr(item, "text") and getattr(item, "text"):
+                    parts.append(str(getattr(item, "text")))
+            return "".join(parts)
+        return str(value)
 
     @classmethod
     def _model_sort_key(cls, model_name: str) -> tuple:
@@ -869,6 +907,15 @@ class HybridGeospatialRAGPipeline:
             "timed out",
             "readtimeout",
             "apitimeouterror",
+        ]
+        return any(signal in text for signal in signals)
+
+    @staticmethod
+    def _is_empty_response_error(exc: Exception) -> bool:
+        text = str(exc).lower()
+        signals = [
+            "empty response",
+            "reasoning-only response",
         ]
         return any(signal in text for signal in signals)
 

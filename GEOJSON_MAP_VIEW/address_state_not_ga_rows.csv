@@ -1,0 +1,5 @@
+company_name,labeled_location,address,latitude,longitude,labeled_county,computed_county,location_city,address_city,address_state,outside_polygon,duplicate_cluster_id,duplicate_risk_class,conflict_flags
+Michelin Tread Technologies,"Lawrenceville, Gwinnett County","1 Parkway South Blvd, Greenville, SC 29615",34.8611177082749,-82.258199703858,Gwinnett,,Lawrenceville,Greenville,SC,True,,,address_state_not_ga | location_city_vs_address_city_conflict | outside_georgia_polygon
+Morgan Corp.,"Lawrenceville, Gwinnett County","15 Morgan Center Dr, Morganton, NC 28655",35.754058,-81.667538,Gwinnett,,Lawrenceville,Morganton,NC,True,,,address_state_not_ga | location_city_vs_address_city_conflict | outside_georgia_polygon
+Volvo Cars USA,Georgia,"1800 Volvo Place, Mahwah, NJ 07430",41.0740427635951,-74.1712478395491,,,,Mahwah,NJ,True,,,address_state_not_ga | outside_georgia_polygon
+Volvo Group North America,Georgia,"7900 National Service Rd, Greensboro, NC 27409",36.0818642621738,-79.9684288843386,,,,Greensboro,NC,True,,,address_state_not_ga | outside_georgia_polygon

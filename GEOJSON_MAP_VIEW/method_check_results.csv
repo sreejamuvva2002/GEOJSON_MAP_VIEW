@@ -1,0 +1,12 @@
+check,result,evidence,interpretation
+GeoJSON structurally valid FeatureCollection,True,"type=FeatureCollection, features=159",GeoJSON structure is valid.
+GeoJSON geometry validity,False,"invalid_geometries=3, missing_geometry=0",Geometry issues exist in the GeoJSON.
+GeoJSON county coverage / naming,True,"unique_counties=159, expected=159, duplicate_names=0",County count and naming look correct for Georgia.
+GeoJSON / workbook CRS mismatch,True,"geojson_bounds={'min_lon': -85.60516962273933, 'min_lat': 30.355762753237457, 'max_lon': -80.75143205861123, 'max_lat': 35.00066574851129}, sample_point_range=lat[22.094,41.074] lon[-85.897,82.150]",Both files use degree-like coordinates consistent with WGS84. A CRS mismatch is not the main explanation.
+Latitude/longitude swapped in point creation,False,"inside_count_current=193, inside_count_swapped=0","Swapping lat/lon makes the results worse, not better."
+County suffix / case mismatch causing false mismatches,False,"matches_current=10, matches_normalized=10",More aggressive normalization does not rescue the mismatch count.
+City vs county compared incorrectly,False,"Comparison uses county extracted from the Location field via regex on ""County"", not the city token.","The mismatch metric is county-vs-county, not city-vs-county."
+County parsing failure is the main cause,False,"rows_with_county_keyword=181, parse_failures_with_county_keyword=0",County parsing works for almost all rows that actually contain a county string.
+Duplicate rows / multi-role rows explain most mismatches,False,"duplicate_clusters=17, facility_variant_groups=6, mismatches_nonduplicate_subset=136/144 (~94.44%)","Duplicates exist, but removing them does not fix the problem."
+HQ vs facility confusion / workbook inconsistency is present,True,"city_conflict_rows=152, address_state_not_ga_rows=4, repeated_same_facility_multiple_locations=6","Yes. Many rows look like the location label, address, and coordinates refer to different places."
+Bad join or upstream misalignment is a plausible main cause,True,"Examples include same address with multiple unrelated locations, different companies sharing copied coordinates, and address/location contradictions inside the workbook.","The audit cannot prove the upstream step, but the evidence strongly supports join/misalignment or workbook contamination."

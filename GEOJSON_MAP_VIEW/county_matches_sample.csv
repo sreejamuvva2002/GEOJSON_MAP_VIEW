@@ -1,0 +1,6 @@
+company_name,labeled_location,address,latitude,longitude,computed_county,labeled_county,address_city,address_state
+ADVICS Manufacturing Georgia LLC,Troup County,"1621 Lukken Industrial Dr W, LaGrange, GA 30240",33.0113943,-85.0615448,Troup,Troup,Lagrange,GA
+Constellium Automotive USA,"Cartersville, Bartow County","1 Constellium Way, Cartersville, GA 30120",34.1773609,-84.8109876,Bartow,Bartow,Cartersville,GA
+Daimler Truck North America,"Covington, Newton County","7400 E Freeman Pkwy, Covington, GA 30014",33.5182052,-84.0153106,Newton,Newton,Covington,GA
+Kyungshin America Corp.,Troup County,"85 Kyungshin Dr, West Point, GA 31833",32.8772531,-85.183728,Troup,Troup,West Point,GA
+Textron Specialized Vehicles,"Augusta, Richmond County","1451 Marvin Griffin Rd, Augusta, GA 30906",33.3956126,-81.9878236,Richmond,Richmond,Augusta,GA

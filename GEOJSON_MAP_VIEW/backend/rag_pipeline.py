@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 from pathlib import Path
@@ -8,6 +9,8 @@ from typing import Dict, List, Optional
 import pandas as pd
 from openai import OpenAI
 
+from backend.analytics_engine import AnalyticsEngine
+from backend.geo_utils import PROJECTED_CRS, canonical_county_display_name, normalize_county_name, stable_company_slug
 from backend.query_planner import QueryPlanner
 from backend.spatial_engine import SpatialEngine
 from backend.sql_engine import SQLEngine
@@ -18,6 +21,7 @@ DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "gnem.duckdb"
 DEFAULT_GEOJSON_PATH = PROJECT_ROOT / "data" / "Counties_Georgia.geojson"
 DEFAULT_FAISS_PATH = PROJECT_ROOT / "data" / "gnem_faiss.index"
 DEFAULT_METADATA_PATH = PROJECT_ROOT / "data" / "vector_metadata.json"
+DEFAULT_INGESTION_METADATA_PATH = PROJECT_ROOT / "data" / "ingestion_run_metadata.json"
 QUESTION_STOPWORDS = {
     "a",
     "an",
@@ -49,6 +53,7 @@ QUESTION_STOPWORDS = {
     "who",
     "why",
 }
+_CITATION_RE = re.compile(r"\[(DOC:[^\]]+|GEO:[^\]]+|ANALYTIC:[^\]]+)\]")
 
 
 class HybridGeospatialRAGPipeline:
@@ -59,10 +64,16 @@ class HybridGeospatialRAGPipeline:
         faiss_path: Path = DEFAULT_FAISS_PATH,
         metadata_path: Path = DEFAULT_METADATA_PATH,
     ) -> None:
+        self.db_path = Path(db_path)
+        self.geojson_path = Path(geojson_path)
         self.sql_engine = SQLEngine(db_path=db_path)
+        self.analytics_engine = AnalyticsEngine(db_path=db_path)
+        self.analytics_engine.ensure_required_tables()
         self.spatial_engine = SpatialEngine(db_path=db_path, geojson_path=geojson_path)
         self.vector_engine = VectorEngine(faiss_path=faiss_path, metadata_path=metadata_path)
         self.query_planner = QueryPlanner()
+        self.ingestion_metadata = self._load_ingestion_metadata()
+        self.default_mode = os.getenv("MODE", "eval").strip().lower()
 
         self.llm_base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1")
         self.llm_client = OpenAI(
@@ -73,11 +84,6 @@ class HybridGeospatialRAGPipeline:
         )
         self.available_models = self._list_available_models()
         self.llm_model = os.getenv("OLLAMA_MODEL") or self._choose_default_model()
-        if not self.llm_model:
-            raise RuntimeError(
-                "No Ollama model available. Pull one first (for example: ollama pull qwen2.5:14b) "
-                "or set OLLAMA_MODEL explicitly."
-            )
         self.fallback_model_preferences = [
             "qwen2.5:14b",
             "qwen2.5:7b",
@@ -92,140 +98,206 @@ class HybridGeospatialRAGPipeline:
             "tinyllama:latest",
         ]
 
-    def answer_question(self, question: str) -> dict:
-        plan = self.query_planner.plan(question)
-        hints = plan.get("hints", {})
+    def answer_question(self, question: str, selected_county: Optional[str] = None, mode: Optional[str] = None) -> dict:
+        effective_mode = (mode or self.default_mode or "eval").strip().lower()
+        plan = self.query_planner.plan(question, selected_county=selected_county)
+        route_type = str(plan.get("route_type") or "llm_synthesis")
+        hints = dict(plan.get("hints", {}))
 
-        sql_df = pd.DataFrame()
-        vector_df = pd.DataFrame()
-        geo_df = pd.DataFrame()
+        if route_type == "web_needed":
+            return self._unsupported_response(question=question, plan=plan, mode=effective_mode)
 
-        if plan.get("sql"):
-            sql_df = self._run_sql_retrieval(question, hints)
+        if route_type == "lookup":
+            result = self._run_lookup_route(question=question, plan=plan)
+            return self._build_response(plan=plan, mode=effective_mode, **result)
 
-        if plan.get("vector"):
-            top_k = 14 if plan.get("geo") else 8
-            vector_df = self.vector_engine.semantic_company_search(question, top_k=top_k, per_company_limit=6)
-            vector_df = self._optional_keyword_filter(vector_df, question)
-            vector_df = self._apply_structured_filters(vector_df, hints)
-            if hints.get("oem"):
-                vector_df = self._filter_by_oem(vector_df, str(hints["oem"]))
+        if route_type == "analytic_local":
+            result = self._run_analytic_route(question=question, plan=plan)
+            return self._build_response(plan=plan, mode=effective_mode, **result)
 
-        if plan.get("geo"):
-            radius_km = float(hints.get("radius_km", 100.0))
-            candidates = self._merge_candidates([vector_df, sql_df])
-            candidate_input = None if candidates.empty else candidates
+        sql_df = self._run_sql_retrieval(question, hints) if plan.get("sql") else pd.DataFrame()
+        vector_df = self._run_vector_retrieval(question, hints) if plan.get("vector") else pd.DataFrame()
 
-            coords = hints.get("coordinates")
-            city = hints.get("city")
-            if isinstance(coords, dict) and "lat" in coords and "lon" in coords:
-                geo_df = self.spatial_engine.companies_within_radius(
-                    lat=float(coords["lat"]),
-                    lon=float(coords["lon"]),
-                    radius_km=radius_km,
-                    candidates=candidate_input,
-                )
-            elif city:
-                geo_df = self.spatial_engine.companies_near_city(
-                    city_name=str(city),
-                    radius_km=radius_km,
-                    candidates=candidate_input,
-                )
+        if hints.get("selected_county"):
+            sql_df = self._filter_dataframe_to_county(sql_df, str(hints["selected_county"]))
+            vector_df = self._filter_dataframe_to_county(vector_df, str(hints["selected_county"]))
 
-            if geo_df.empty and candidate_input is not None:
-                if isinstance(coords, dict) and "lat" in coords and "lon" in coords:
-                    geo_df = self.spatial_engine.companies_within_radius(
-                        lat=float(coords["lat"]),
-                        lon=float(coords["lon"]),
-                        radius_km=radius_km,
-                        candidates=None,
-                    )
-                elif city:
-                    geo_df = self.spatial_engine.companies_near_city(
-                        city_name=str(city),
-                        radius_km=radius_km,
-                        candidates=None,
-                    )
-
-            geo_df = self._optional_keyword_filter(geo_df, question)
-            geo_df = self._apply_structured_filters(geo_df, hints)
-            if hints.get("oem"):
-                geo_df = self._filter_by_oem(geo_df, str(hints["oem"]))
-
-        if plan.get("geo"):
-            final_df = geo_df.copy()
-        else:
-            final_df = self._choose_final_results(sql_df=sql_df, vector_df=vector_df, geo_df=geo_df)
-
-        if self._should_reject_as_unsupported(
-            question=question,
-            plan=plan,
-            sql_df=sql_df,
-            vector_df=vector_df,
-            geo_df=geo_df,
-            final_df=final_df,
-        ):
-            return self._unsupported_response(question=question, plan=plan)
+        final_df = self._choose_final_results(sql_df=sql_df, vector_df=vector_df)
+        if self._should_reject_as_unsupported(question=question, sql_df=sql_df, vector_df=vector_df, final_df=final_df):
+            return self._unsupported_response(question=question, plan=plan, mode=effective_mode)
 
         final_df = self._annotate_map_weights(final_df, question=question, plan=plan)
-
-        if plan.get("geo") and final_df.empty:
-            retrieved_chunks = [self._build_geo_no_results_chunk(question=question, hints=hints)]
-        else:
-            retrieved_chunks = self._build_retrieved_chunks(
-                question=question,
-                vector_df=vector_df,
-                sql_df=sql_df,
-                geo_df=geo_df,
-                final_df=final_df,
-            )
+        retrieved_chunks = self._build_retrieved_chunks(vector_df=vector_df, sql_df=sql_df)
         context = self._format_context(question=question, plan=plan, retrieved_chunks=retrieved_chunks)
         answer = self._generate_answer_with_llm(
             question=question,
             context=context,
             retrieved_chunks=retrieved_chunks,
-            preferred_companies=final_df["company"].dropna().astype(str).tolist() if "company" in final_df.columns else [],
+            mode=effective_mode,
         )
+        sources = [self._chunk_source_line(chunk) for chunk in retrieved_chunks[:12]]
 
+        return {
+            "answer": answer,
+            "sources": sources,
+            "retrieved_chunks": retrieved_chunks,
+            "retrieved_companies": self._df_to_records(final_df.head(25)),
+            "plan": plan,
+            "model_used": self.llm_model or "not_called",
+            "route_type": route_type,
+            "evidence_ids": [chunk["evidence_id"] for chunk in retrieved_chunks],
+            "geo_evidence": [],
+            "analytic_evidence": [chunk["meta"] for chunk in retrieved_chunks if str(chunk["evidence_id"]).startswith("ANALYTIC:")],
+            "mode": effective_mode,
+        }
+
+    def _run_lookup_route(self, question: str, plan: Dict[str, object]) -> Dict[str, object]:
+        hints = dict(plan.get("hints", {}))
+        candidates = self._run_sql_retrieval(question, hints) if self._has_structured_filters(hints) else pd.DataFrame()
+        geo_anchor_type = str(plan.get("geo_anchor_type") or "")
+        target_county = plan.get("target_county")
+
+        candidate_input = None if candidates.empty else candidates
+        if geo_anchor_type == "county" and plan.get("requires_polygon_distance"):
+            df = self.spatial_engine.companies_within_miles_of_county(
+                county_name=str(target_county),
+                miles=float(plan.get("radius_miles") or 0.0),
+                candidates=candidate_input,
+            )
+            operation = "county_distance"
+        elif geo_anchor_type == "county":
+            df = self.spatial_engine.companies_in_county(
+                county_name=str(target_county),
+                candidates=candidate_input,
+            )
+            operation = "county_membership"
+        elif geo_anchor_type == "point" and hints.get("coordinates"):
+            coords = hints["coordinates"]
+            df = self.spatial_engine.companies_within_radius(
+                lat=float(coords["lat"]),
+                lon=float(coords["lon"]),
+                radius_km=float(hints.get("radius_km", 0.0)),
+                candidates=candidate_input,
+            )
+            operation = "point_radius"
+        else:
+            city_name = str(hints.get("city") or "")
+            df = self.spatial_engine.companies_near_city(
+                city_name=city_name,
+                radius_km=float(hints.get("radius_km", 100.0)),
+                candidates=candidate_input,
+            )
+            operation = "point_radius"
+
+        if df.empty and candidate_input is not None:
+            if geo_anchor_type == "county" and plan.get("requires_polygon_distance"):
+                df = self.spatial_engine.companies_within_miles_of_county(
+                    county_name=str(target_county),
+                    miles=float(plan.get("radius_miles") or 0.0),
+                    candidates=None,
+                )
+            elif geo_anchor_type == "county":
+                df = self.spatial_engine.companies_in_county(county_name=str(target_county), candidates=None)
+            elif geo_anchor_type == "point" and hints.get("coordinates"):
+                coords = hints["coordinates"]
+                df = self.spatial_engine.companies_within_radius(
+                    lat=float(coords["lat"]),
+                    lon=float(coords["lon"]),
+                    radius_km=float(hints.get("radius_km", 0.0)),
+                    candidates=None,
+                )
+            else:
+                df = self.spatial_engine.companies_near_city(
+                    city_name=str(hints.get("city") or ""),
+                    radius_km=float(hints.get("radius_km", 100.0)),
+                    candidates=None,
+                )
+
+        df = self._apply_structured_filters(df, hints)
+        if hints.get("oem"):
+            df = self._filter_by_oem(df, str(hints["oem"]))
+        if hints.get("selected_county") and not target_county:
+            df = self._filter_dataframe_to_county(df, str(hints["selected_county"]))
+        df = self._annotate_map_weights(df, question=question, plan=plan)
+
+        if df.empty:
+            no_result_chunk = self._build_geo_no_results_chunk(question=question, plan=plan, operation=operation)
+            return {
+                "answer": self._build_no_results_answer(no_result_chunk),
+                "sources": [self._chunk_source_line(no_result_chunk)],
+                "retrieved_chunks": [no_result_chunk],
+                "retrieved_companies": [],
+                "model_used": "not_called",
+                "route_type": plan["route_type"],
+                "evidence_ids": [no_result_chunk["evidence_id"]],
+                "geo_evidence": [no_result_chunk["meta"]],
+                "analytic_evidence": [],
+            }
+
+        retrieved_chunks, geo_evidence = self._build_geo_chunks(df=df, plan=plan, operation=operation)
+        answer = self._build_geo_answer(question=question, plan=plan, df=df, retrieved_chunks=retrieved_chunks)
         return {
             "answer": answer,
             "sources": [self._chunk_source_line(chunk) for chunk in retrieved_chunks[:12]],
             "retrieved_chunks": retrieved_chunks,
-            "retrieved_companies": self._df_to_records(final_df.head(25)),
-            "plan": plan,
-            "model_used": self.llm_model,
+            "retrieved_companies": self._df_to_records(df.head(25)),
+            "model_used": "not_called",
+            "route_type": plan["route_type"],
+            "evidence_ids": [chunk["evidence_id"] for chunk in retrieved_chunks],
+            "geo_evidence": geo_evidence,
+            "analytic_evidence": [],
         }
 
-    def _choose_default_model(self) -> Optional[str]:
-        preferred = [
-            "qwen2.5:14b",
-            "qwen3:14b",
-            "gpt-oss:20b",
-            "mistral-small3.2:24b",
-            "llama3.1:8b",
-            "gemma3:12b",
-            "qwen3:8b",
-            "deepseek-r1:14b",
-            "deepseek-r1:8b",
-            "qwen3:4b",
-            "llama3.2:3b",
-            "gemma3:4b",
-            "tinyllama:latest",
-        ]
-        model_ids = self.available_models
-        if not model_ids:
-            return None
-        for candidate in preferred:
-            if candidate in model_ids:
-                return candidate
-        return model_ids[0]
+    def _run_analytic_route(self, question: str, plan: Dict[str, object]) -> Dict[str, object]:
+        analytic_metric = str(plan.get("analytic_metric") or "")
+        analytic_term = str(plan.get("analytic_term") or "")
 
-    def _list_available_models(self) -> List[str]:
+        if analytic_metric == "zero_gap":
+            df = self.analytics_engine.counties_with_zero_matches(analytic_term)
+            retrieved_chunks = self._build_zero_gap_chunks(df=df, term=analytic_term)
+            answer = self._build_zero_gap_answer(question=question, df=df, retrieved_chunks=retrieved_chunks, term=analytic_term)
+            return {
+                "answer": answer,
+                "sources": [self._chunk_source_line(chunk) for chunk in retrieved_chunks[:12]],
+                "retrieved_chunks": retrieved_chunks,
+                "retrieved_companies": self._df_to_records(df.head(50)),
+                "model_used": "not_called",
+                "route_type": plan["route_type"],
+                "evidence_ids": [chunk["evidence_id"] for chunk in retrieved_chunks],
+                "geo_evidence": [],
+                "analytic_evidence": [chunk["meta"] for chunk in retrieved_chunks],
+            }
+
+        df = self.analytics_engine.top_companies_by_metric(analytic_metric, limit=15)
+        df = self._annotate_map_weights(df, question=question, plan=plan)
+        retrieved_chunks = self._build_metric_chunks(df=df, metric=analytic_metric)
+        answer = self._build_metric_answer(question=question, df=df, retrieved_chunks=retrieved_chunks, metric=analytic_metric)
+        return {
+            "answer": answer,
+            "sources": [self._chunk_source_line(chunk) for chunk in retrieved_chunks[:12]],
+            "retrieved_chunks": retrieved_chunks,
+            "retrieved_companies": self._df_to_records(df.head(25)),
+            "model_used": "not_called",
+            "route_type": plan["route_type"],
+            "evidence_ids": [chunk["evidence_id"] for chunk in retrieved_chunks],
+            "geo_evidence": [],
+            "analytic_evidence": [chunk["meta"] for chunk in retrieved_chunks],
+        }
+
+    def _load_ingestion_metadata(self) -> Dict[str, object]:
+        if not DEFAULT_INGESTION_METADATA_PATH.exists():
+            return {}
         try:
-            models = self.llm_client.models.list()
-            return [m.id for m in getattr(models, "data", []) if getattr(m, "id", None)]
+            return json.loads(DEFAULT_INGESTION_METADATA_PATH.read_text(encoding="utf-8"))
         except Exception:
-            return []
+            return {}
+
+    def _build_response(self, plan: Dict[str, object], mode: str, **payload: object) -> dict:
+        return {
+            "plan": plan,
+            "mode": mode,
+            **payload,
+        }
 
     def _run_sql_retrieval(self, question: str, hints: dict) -> pd.DataFrame:
         if hints.get("metric"):
@@ -247,6 +319,18 @@ class HybridGeospatialRAGPipeline:
         if "top" in lower and "employment" in lower:
             return self.sql_engine.get_top_companies_by_metric("employment", limit=15)
         return pd.DataFrame()
+
+    def _run_vector_retrieval(self, question: str, hints: dict) -> pd.DataFrame:
+        vector_df = self.vector_engine.semantic_company_search(question, top_k=10, per_company_limit=6)
+        vector_df = self._optional_keyword_filter(vector_df, question)
+        vector_df = self._apply_structured_filters(vector_df, hints)
+        if hints.get("oem"):
+            vector_df = self._filter_by_oem(vector_df, str(hints["oem"]))
+        return vector_df
+
+    @staticmethod
+    def _has_structured_filters(hints: Dict[str, object]) -> bool:
+        return any(hints.get(key) for key in ["oem", "category_term", "capability_term", "city"])
 
     @staticmethod
     def _filter_by_oem(df: pd.DataFrame, oem: str) -> pd.DataFrame:
@@ -287,8 +371,7 @@ class HybridGeospatialRAGPipeline:
         filtered = df[mask].copy()
         return filtered if not filtered.empty else df
 
-    @staticmethod
-    def _apply_structured_filters(df: pd.DataFrame, hints: dict) -> pd.DataFrame:
+    def _apply_structured_filters(self, df: pd.DataFrame, hints: dict) -> pd.DataFrame:
         if df.empty:
             return df
 
@@ -314,23 +397,28 @@ class HybridGeospatialRAGPipeline:
                 if mask.any():
                     filtered = filtered[mask].copy()
 
+        if hints.get("selected_county"):
+            filtered = self._filter_dataframe_to_county(filtered, str(hints["selected_county"]))
+
         return filtered
 
     @staticmethod
-    def _merge_candidates(frames: List[pd.DataFrame]) -> pd.DataFrame:
-        non_empty = [df for df in frames if not df.empty]
-        if not non_empty:
-            return pd.DataFrame()
-
-        merged = pd.concat(non_empty, ignore_index=True, sort=False)
-        if "company" in merged.columns:
-            merged = merged.drop_duplicates(subset=["company"], keep="first")
-        return merged
+    def _filter_dataframe_to_county(df: pd.DataFrame, county_name: str) -> pd.DataFrame:
+        if df.empty:
+            return df
+        county_key = normalize_county_name(county_name)
+        if not county_key:
+            return df
+        if "county_key" in df.columns:
+            mask = df["county_key"].fillna("").astype(str) == county_key
+            return df[mask].copy()
+        if "county" in df.columns:
+            mask = df["county"].fillna("").apply(normalize_county_name) == county_key
+            return df[mask].copy()
+        return df
 
     @staticmethod
-    def _choose_final_results(sql_df: pd.DataFrame, vector_df: pd.DataFrame, geo_df: pd.DataFrame) -> pd.DataFrame:
-        if not geo_df.empty:
-            return geo_df
+    def _choose_final_results(sql_df: pd.DataFrame, vector_df: pd.DataFrame) -> pd.DataFrame:
         if not sql_df.empty and not vector_df.empty:
             merged = pd.concat([sql_df, vector_df], ignore_index=True, sort=False)
             if "company" in merged.columns:
@@ -357,15 +445,11 @@ class HybridGeospatialRAGPipeline:
     def _should_reject_as_unsupported(
         self,
         question: str,
-        plan: Dict[str, object],
         sql_df: pd.DataFrame,
         vector_df: pd.DataFrame,
-        geo_df: pd.DataFrame,
         final_df: pd.DataFrame,
     ) -> bool:
-        if plan.get("geo"):
-            return False
-        if not sql_df.empty or not geo_df.empty:
+        if not sql_df.empty:
             return False
         if vector_df.empty and final_df.empty:
             return True
@@ -392,18 +476,22 @@ class HybridGeospatialRAGPipeline:
             return False
         return True
 
-    def _unsupported_response(self, question: str, plan: Dict[str, object]) -> dict:
+    def _unsupported_response(self, question: str, plan: Dict[str, object], mode: str) -> dict:
         return {
             "answer": (
-                f"I could not find evidence in the GNEM company dataset and coordinate data to answer "
-                f"'{question}'. Ask about companies, OEM relationships, products/services, employment, "
-                "or geospatial proximity in the uploaded sources."
+                f"I could not find deterministic evidence in the GNEM dataset to answer '{question}'. "
+                "Try a county, radius, OEM, role/category, product/service, or employment question."
             ),
             "sources": [],
             "retrieved_chunks": [],
             "retrieved_companies": [],
             "plan": plan,
             "model_used": "not_called",
+            "route_type": plan.get("route_type", "web_needed"),
+            "evidence_ids": [],
+            "geo_evidence": [],
+            "analytic_evidence": [],
+            "mode": mode,
         }
 
     def _annotate_map_weights(self, df: pd.DataFrame, question: str, plan: Dict[str, object]) -> pd.DataFrame:
@@ -416,7 +504,7 @@ class HybridGeospatialRAGPipeline:
         out["map_relevance"] = self._compute_relevance_component(out)
         out["map_query_match"] = self._compute_query_match_component(out, question=question)
         out["map_proximity"] = self._compute_proximity_component(out, hints=hints)
-        out["map_metric"] = self._compute_metric_component(out, hints=hints)
+        out["map_metric"] = self._compute_metric_component(out)
         out["map_business_priority"] = out.apply(
             lambda row: self._business_priority_score(row, hints=hints),
             axis=1,
@@ -443,16 +531,8 @@ class HybridGeospatialRAGPipeline:
                 value_f = float(value)
                 weighted_sum += value_f * column_weight
                 total_weight += column_weight
-                if column == "map_relevance" and value_f > 0:
-                    parts.append(f"retrieval={value_f:.2f}")
-                elif column == "map_query_match" and value_f > 0:
-                    parts.append(f"query_match={value_f:.2f}")
-                elif column == "map_proximity" and value_f > 0:
-                    parts.append(f"proximity={value_f:.2f}")
-                elif column == "map_business_priority" and value_f > 0:
-                    parts.append(f"business={value_f:.2f}")
-                elif column == "map_metric" and value_f > 0:
-                    parts.append(f"metric={value_f:.2f}")
+                if value_f > 0:
+                    parts.append(f"{column.replace('map_', '')}={value_f:.2f}")
 
             score = weighted_sum / total_weight if total_weight > 0 else 0.5
             map_weights.append(round(max(0.05, min(1.0, score)), 4))
@@ -469,8 +549,7 @@ class HybridGeospatialRAGPipeline:
     @staticmethod
     def _compute_relevance_component(df: pd.DataFrame) -> pd.Series:
         if "hybrid_score" in df.columns:
-            series = pd.to_numeric(df["hybrid_score"], errors="coerce").fillna(0.0).clip(lower=0.0, upper=1.0)
-            return series
+            return pd.to_numeric(df["hybrid_score"], errors="coerce").fillna(0.0).clip(lower=0.0, upper=1.0)
         if "lexical_score" in df.columns:
             return pd.to_numeric(df["lexical_score"], errors="coerce").fillna(0.0).clip(lower=0.0, upper=1.0)
         if "semantic_score" in df.columns:
@@ -527,7 +606,7 @@ class HybridGeospatialRAGPipeline:
         return proximity.fillna(pd.NA).clip(lower=0.0, upper=1.0)
 
     @staticmethod
-    def _compute_metric_component(df: pd.DataFrame, hints: Dict[str, object]) -> pd.Series:
+    def _compute_metric_component(df: pd.DataFrame) -> pd.Series:
         metric_col = "metric_value" if "metric_value" in df.columns else None
         if metric_col is None:
             return pd.Series([pd.NA] * len(df), index=df.index, dtype="object")
@@ -540,8 +619,6 @@ class HybridGeospatialRAGPipeline:
             return pd.Series([1.0] * len(df), index=df.index, dtype="float64")
 
         normalized = (values - float(valid.min())) / max(float(valid.max()) - float(valid.min()), 1e-6)
-        if hints.get("metric"):
-            return normalized.fillna(pd.NA).clip(lower=0.0, upper=1.0)
         return normalized.fillna(pd.NA).clip(lower=0.0, upper=1.0)
 
     @staticmethod
@@ -581,205 +658,282 @@ class HybridGeospatialRAGPipeline:
 
         return round(max(0.0, min(1.0, score)), 4)
 
-    @staticmethod
-    def _build_geo_no_results_chunk(question: str, hints: dict) -> Dict[str, object]:
-        radius_km = hints.get("radius_km")
-        radius_text = f"{float(radius_km):.1f} km" if radius_km is not None else "the requested radius"
-        if hints.get("city"):
-            target = f"near {hints['city']}"
-        elif hints.get("coordinates"):
-            coords = hints["coordinates"]
-            target = f"near coordinates ({coords.get('lat')}, {coords.get('lon')})"
-        else:
-            target = "for the requested geography"
-
-        filters = []
-        if hints.get("oem"):
-            filters.append(f"OEM={hints['oem']}")
-        if hints.get("category_term"):
-            filters.append(f"category={hints['category_term']}")
-        if hints.get("capability_term"):
-            filters.append(f"capability={hints['capability_term']}")
-        filter_text = f" after applying filters ({', '.join(filters)})" if filters else ""
-
-        return {
-            "chunk_id": "C1",
-            "engine": "geo",
-            "company": None,
-            "chunk_type": "geo_no_results",
-            "score": 1.0,
-            "text": (
-                f"No companies matched {radius_text} {target}{filter_text}. "
-                f"Question searched: {question}"
-            ),
-            "meta": {"radius_km": radius_km, "target": target, "filters": filters},
-        }
-
-    def _build_retrieved_chunks(
-        self,
-        question: str,
-        vector_df: pd.DataFrame,
-        sql_df: pd.DataFrame,
-        geo_df: pd.DataFrame,
-        final_df: pd.DataFrame,
-    ) -> List[Dict[str, object]]:
+    def _build_geo_chunks(self, df: pd.DataFrame, plan: Dict[str, object], operation: str) -> tuple[List[Dict[str, object]], List[Dict[str, object]]]:
         chunks: List[Dict[str, object]] = []
-        final_companies = set(final_df["company"].dropna().astype(str).tolist()) if "company" in final_df.columns else set()
+        evidence: List[Dict[str, object]] = []
+        county_name = canonical_county_display_name(plan.get("target_county")) if plan.get("target_county") else None
 
-        if not vector_df.empty:
-            for _, row in vector_df.head(6).iterrows():
+        for rank, (_, row) in enumerate(df.head(12).iterrows(), start=1):
+            company = str(row.get("company") or "unknown")
+            company_slug = stable_company_slug(company)
+            county = county_name or canonical_county_display_name(row.get("county")) or "Unknown"
+            evidence_id = f"GEO:{operation}|county={normalize_county_name(county) or 'unknown'}|company={company_slug}"
+            distance_mi = None if pd.isna(row.get("distance_miles")) else float(row.get("distance_miles"))
+            method = str(row.get("distance_method") or ("polygon_containment" if operation == "county_membership" else "geodesic_point_radius"))
+            meta = {
+                "evidence_id": evidence_id,
+                "operation": operation,
+                "county": county,
+                "company_id": company_slug,
+                "company": company,
+                "dist_mi": distance_mi,
+                "crs": PROJECTED_CRS if "polygon" in method else "geodesic",
+                "method": method,
+            }
+            text = (
+                f"{company} in {row.get('city') or 'Unknown city'}, {county}; "
+                f"distance_miles={distance_mi if distance_mi is not None else 0.0:.2f}; "
+                f"coordinate_source={row.get('coordinate_source') or 'unknown'}."
+            )
+            chunks.append(
+                {
+                    "evidence_id": evidence_id,
+                    "engine": "geo",
+                    "company": company,
+                    "chunk_type": operation,
+                    "score": round(1.0 / rank, 4),
+                    "text": text,
+                    "meta": meta,
+                }
+            )
+            evidence.append(meta)
+        return chunks, evidence
+
+    def _build_metric_chunks(self, df: pd.DataFrame, metric: str) -> List[Dict[str, object]]:
+        chunks: List[Dict[str, object]] = []
+        for rank, (_, row) in enumerate(df.head(12).iterrows(), start=1):
+            company = str(row.get("company") or "unknown")
+            company_slug = stable_company_slug(company)
+            metric_value = row.get("metric_value", row.get(metric))
+            evidence_id = f"ANALYTIC:companies|metric={metric}|group={company_slug}"
+            chunks.append(
+                {
+                    "evidence_id": evidence_id,
+                    "engine": "analytic",
+                    "company": company,
+                    "chunk_type": "metric_result",
+                    "score": round(1.0 / rank, 4),
+                    "text": f"{company} has {metric}={metric_value}.",
+                    "meta": {
+                        "evidence_id": evidence_id,
+                        "table": "companies",
+                        "metric": metric,
+                        "group": company_slug,
+                        "company": company,
+                        "value": metric_value,
+                    },
+                }
+            )
+        return chunks
+
+    def _build_zero_gap_chunks(self, df: pd.DataFrame, term: str) -> List[Dict[str, object]]:
+        chunks: List[Dict[str, object]] = []
+        for rank, (_, row) in enumerate(df.head(50).iterrows(), start=1):
+            county_name = str(row.get("county_name") or "Unknown")
+            evidence_id = f"ANALYTIC:county_gap|metric=zero_gap|group={normalize_county_name(county_name) or 'unknown'}"
+            chunks.append(
+                {
+                    "evidence_id": evidence_id,
+                    "engine": "analytic",
+                    "company": None,
+                    "chunk_type": "zero_gap",
+                    "score": round(1.0 / rank, 4),
+                    "text": f"{county_name} County has zero matches for '{term}'.",
+                    "meta": {
+                        "evidence_id": evidence_id,
+                        "table": "county_gap",
+                        "metric": "zero_gap",
+                        "group": county_name,
+                        "analytic_term": term,
+                    },
+                }
+            )
+        return chunks
+
+    def _build_retrieved_chunks(self, vector_df: pd.DataFrame, sql_df: pd.DataFrame) -> List[Dict[str, object]]:
+        chunks: List[Dict[str, object]] = []
+
+        if not sql_df.empty:
+            for rank, (_, row) in enumerate(sql_df.head(6).iterrows(), start=1):
+                company = str(row.get("company") or "unknown")
+                company_slug = stable_company_slug(company)
+                evidence_id = f"ANALYTIC:company_lookup|metric=match|group={company_slug}"
                 chunks.append(
                     {
+                        "evidence_id": evidence_id,
+                        "engine": "analytic",
+                        "company": company,
+                        "chunk_type": "sql_result",
+                        "score": round(1.0 / rank, 4),
+                        "text": (
+                            f"SQL result for {company}: industry={row.get('industry_group')}, "
+                            f"role={row.get('ev_supply_chain_role')}, OEMs={row.get('primary_oems')}."
+                        ),
+                        "meta": {
+                            "evidence_id": evidence_id,
+                            "table": "companies",
+                            "metric": "match",
+                            "group": company_slug,
+                            "company": company,
+                        },
+                    }
+                )
+
+        if not vector_df.empty:
+            for _, row in vector_df.head(8).iterrows():
+                doc_ref = str(row.get("chunk_id") or "unknown")
+                evidence_id = f"DOC:{doc_ref}"
+                chunks.append(
+                    {
+                        "evidence_id": evidence_id,
                         "engine": "vector",
                         "company": row.get("company"),
                         "chunk_type": row.get("chunk_type", "vector_chunk"),
-                        "score": float(row.get("hybrid_score", row.get("semantic_score", 0.0))),
+                        "score": round(float(row.get("hybrid_score", row.get("semantic_score", 0.0))), 4),
                         "text": str(row.get("chunk_text", "")).strip(),
                         "meta": {
+                            "evidence_id": evidence_id,
+                            "chunk_ref": doc_ref,
                             "semantic_score": row.get("semantic_score"),
                             "lexical_score": row.get("lexical_score"),
-                            "chunk_ref": row.get("chunk_id"),
                         },
-                        "priority": 1 if str(row.get("company")) in final_companies else 2,
                     }
                 )
 
-        if not geo_df.empty:
-            for rank, (_, row) in enumerate(geo_df.head(4).iterrows(), start=1):
-                distance_km = row.get("distance_km")
-                dist_txt = f"{float(distance_km):.2f} km" if pd.notna(distance_km) else "unknown"
-                text = (
-                    f"Geo match for {row.get('company')}: "
-                    f"{row.get('city')}, {row.get('county')} at distance {dist_txt}; "
-                    f"lat={row.get('latitude')}, lon={row.get('longitude')}."
-                )
-                chunks.append(
-                    {
-                        "engine": "geo",
-                        "company": row.get("company"),
-                        "chunk_type": "geo_match",
-                        "score": 1.0 / rank,
-                        "text": text,
-                        "meta": {"distance_km": distance_km},
-                        "priority": 1,
-                    }
-                )
-
-        if not sql_df.empty:
-            for rank, (_, row) in enumerate(sql_df.head(4).iterrows(), start=1):
-                metric_value = row.get("metric_value", row.get("employment"))
-                text = (
-                    f"SQL result for {row.get('company')}: "
-                    f"industry={row.get('industry_group')}, role={row.get('ev_supply_chain_role')}, "
-                    f"OEMs={row.get('primary_oems')}, metric={metric_value}."
-                )
-                chunks.append(
-                    {
-                        "engine": "sql",
-                        "company": row.get("company"),
-                        "chunk_type": "sql_result",
-                        "score": 1.0 / rank,
-                        "text": text,
-                        "meta": {"metric_value": metric_value},
-                        "priority": 1 if str(row.get("company")) in final_companies else 3,
-                    }
-                )
-
-        chunks = self._dedupe_chunks(chunks)
-        chunks = sorted(chunks, key=lambda x: (x["priority"], -float(x.get("score", 0.0))))
-        if not chunks:
-            chunks = [
-                {
-                    "engine": "system",
-                    "company": None,
-                    "chunk_type": "no_results",
-                    "score": 0.0,
-                    "text": f"No retrieval hits were found for question: {question}",
-                    "meta": {},
-                    "priority": 9,
-                }
-            ]
-
-        out: List[Dict[str, object]] = []
-        for idx, chunk in enumerate(chunks[:8], start=1):
-            out.append(
-                {
-                    "chunk_id": f"C{idx}",
-                    "engine": chunk["engine"],
-                    "company": chunk.get("company"),
-                    "chunk_type": chunk.get("chunk_type"),
-                    "score": round(float(chunk.get("score", 0.0)), 4),
-                    "text": str(chunk.get("text", "")),
-                    "meta": chunk.get("meta", {}),
-                }
-            )
-        return out
-
-    @staticmethod
-    def _dedupe_chunks(chunks: List[Dict[str, object]]) -> List[Dict[str, object]]:
         seen = set()
         out = []
         for chunk in chunks:
-            key = (
-                chunk.get("engine"),
-                chunk.get("company"),
-                str(chunk.get("chunk_type")),
-                str(chunk.get("text", ""))[:180],
-            )
+            key = (chunk["evidence_id"], chunk.get("company"), str(chunk.get("text", ""))[:160])
             if key in seen:
                 continue
             seen.add(key)
             out.append(chunk)
         return out
 
+    @staticmethod
+    def _build_geo_no_results_chunk(question: str, plan: Dict[str, object], operation: str) -> Dict[str, object]:
+        county_name = canonical_county_display_name(plan.get("target_county")) if plan.get("target_county") else None
+        if county_name:
+            evidence_id = f"GEO:{operation}|county={normalize_county_name(county_name) or 'unknown'}|company=no-results"
+        else:
+            evidence_id = f"GEO:{operation}|county=unknown|company=no-results"
+        return {
+            "evidence_id": evidence_id,
+            "engine": "geo",
+            "company": None,
+            "chunk_type": "geo_no_results",
+            "score": 1.0,
+            "text": f"No validated companies matched the deterministic geo query for '{question}'.",
+            "meta": {
+                "evidence_id": evidence_id,
+                "operation": operation,
+                "county": county_name,
+                "company_id": None,
+                "dist_mi": None,
+                "crs": PROJECTED_CRS,
+                "method": "no_results",
+            },
+        }
+
+    @staticmethod
+    def _build_no_results_answer(chunk: Dict[str, object]) -> str:
+        return f"- {chunk['text']} [{chunk['evidence_id']}]"
+
+    def _build_geo_answer(self, question: str, plan: Dict[str, object], df: pd.DataFrame, retrieved_chunks: List[Dict[str, object]]) -> str:
+        if df.empty:
+            return "No deterministic geo results were found."
+
+        lines = []
+        county_name = canonical_county_display_name(plan.get("target_county")) if plan.get("target_county") else None
+        if plan.get("requires_polygon_distance") and county_name:
+            lines.append(
+                f"- Found {len(df)} validated companies within {float(plan.get('radius_miles') or 0.0):.1f} miles of {county_name} County using polygon distance in {PROJECTED_CRS}. [{retrieved_chunks[0]['evidence_id']}]"
+            )
+        elif county_name:
+            lines.append(
+                f"- Found {len(df)} validated companies in {county_name} County by point-in-polygon county membership. [{retrieved_chunks[0]['evidence_id']}]"
+            )
+        else:
+            lines.append(
+                f"- Found {len(df)} validated companies for the requested point-radius search. [{retrieved_chunks[0]['evidence_id']}]"
+            )
+
+        for chunk in retrieved_chunks[:5]:
+            company = chunk.get("company") or "Unknown company"
+            dist_mi = chunk["meta"].get("dist_mi")
+            if dist_mi is not None:
+                lines.append(f"- {company} at {dist_mi:.2f} miles. [{chunk['evidence_id']}]")
+            else:
+                lines.append(f"- {company}. [{chunk['evidence_id']}]")
+        return "\n".join(lines)
+
+    def _build_metric_answer(self, question: str, df: pd.DataFrame, retrieved_chunks: List[Dict[str, object]], metric: str) -> str:
+        if df.empty:
+            return f"- No deterministic {metric} rows were found for '{question}'."
+        lines = [f"- Top deterministic {metric} results from DuckDB. [{retrieved_chunks[0]['evidence_id']}]"]
+        for chunk in retrieved_chunks[:5]:
+            lines.append(f"- {chunk['text']} [{chunk['evidence_id']}]")
+        return "\n".join(lines)
+
+    def _build_zero_gap_answer(self, question: str, df: pd.DataFrame, retrieved_chunks: List[Dict[str, object]], term: str) -> str:
+        if df.empty:
+            return f"- No zero-gap county results were found for '{question}'."
+        lines = [f"- Counties with zero '{term}' matches from deterministic county analytics. [{retrieved_chunks[0]['evidence_id']}]"]
+        for chunk in retrieved_chunks[:8]:
+            lines.append(f"- {chunk['text']} [{chunk['evidence_id']}]")
+        return "\n".join(lines)
+
     def _format_context(self, question: str, plan: dict, retrieved_chunks: List[Dict[str, object]]) -> str:
         lines = [
             f"Question: {question}",
             f"Plan Classification: {plan.get('classification')}",
-            "Retrieved Chunks:",
+            f"Route Type: {plan.get('route_type')}",
+            "Retrieved Evidence:",
         ]
         for chunk in retrieved_chunks:
             company = chunk.get("company") or "N/A"
             chunk_text = str(chunk.get("text", "")).strip()
-            if len(chunk_text) > 140:
-                chunk_text = chunk_text[:140] + "..."
-            lines.append(
-                f"[{chunk['chunk_id']}] engine={chunk['engine']} | company={company} | "
-                f"type={chunk['chunk_type']} | score={chunk['score']}"
-            )
+            if len(chunk_text) > 180:
+                chunk_text = chunk_text[:180] + "..."
+            lines.append(f"[{chunk['evidence_id']}] engine={chunk['engine']} | company={company} | type={chunk['chunk_type']}")
             lines.append(chunk_text)
         return "\n".join(lines).strip()
 
     @staticmethod
     def _chunk_source_line(chunk: Dict[str, object]) -> str:
         snippet = str(chunk.get("text", "")).replace("\n", " ").strip()
-        if len(snippet) > 140:
-            snippet = snippet[:140] + "..."
-        return (
-            f"[{chunk.get('chunk_id')}] {chunk.get('engine')} | "
-            f"{chunk.get('company') or 'N/A'} | score={chunk.get('score')} | {snippet}"
-        )
+        if len(snippet) > 160:
+            snippet = snippet[:160] + "..."
+        return f"[{chunk.get('evidence_id')}] {chunk.get('engine')} | {chunk.get('company') or 'N/A'} | {snippet}"
 
     def _generate_answer_with_llm(
         self,
         question: str,
         context: str,
         retrieved_chunks: List[Dict[str, object]],
-        preferred_companies: Optional[List[str]] = None,
+        mode: str,
     ) -> str:
+        if not retrieved_chunks:
+            return self._citation_failure_response(mode=mode, retrieved_chunks=[], reason="no evidence")
+
         self.available_models = self._list_available_models()
+        if not self.llm_model and self.available_models:
+            self.llm_model = self._choose_default_model()
+        if not self.llm_model:
+            return self._citation_failure_response(mode=mode, retrieved_chunks=retrieved_chunks, reason="no model")
+
         system_prompt = (
             "You are a geospatial enterprise analyst. "
-            "You MUST answer only from the retrieved chunks and cite chunk IDs like [C3]. "
-            "If evidence is missing or ambiguous, say so clearly."
+            "Answer only from retrieved evidence. Every bullet must include at least one evidence citation token "
+            "like [DOC:...] or [ANALYTIC:...]. If evidence is missing, abstain."
         )
         user_prompt = (
             f"{context}\n\n"
             "Instructions:\n"
-            "1. Answer the question directly.\n"
-            "2. Include at least 2 chunk citations when evidence exists.\n"
+            "1. Use short bullet points.\n"
+            "2. Every non-empty bullet must end with at least one evidence citation.\n"
             "3. Do not fabricate company names, distances, OEM links, or metrics.\n"
-            "4. End with a short 'Evidence Gaps' line."
+            "4. End with one bullet that begins with 'Evidence Gaps:'.\n"
         )
         model_candidates = [self.llm_model] + self._oom_fallback_candidates(self.llm_model)
         max_model_attempts = int(os.getenv("OLLAMA_MAX_MODEL_ATTEMPTS", "2"))
@@ -795,21 +949,16 @@ class HybridGeospatialRAGPipeline:
                         {"role": "user", "content": user_prompt},
                     ],
                     temperature=0.1,
-                    max_tokens=80,
+                    max_tokens=180,
                     timeout=request_timeout,
-                    extra_body={"options": {"num_predict": 80, "num_ctx": 1024}},
+                    extra_body={"options": {"num_predict": 180, "num_ctx": 2048}},
                 )
                 self.llm_model = model_name
                 message = response.choices[0].message if response.choices else None
                 content = self._normalize_message_text(getattr(message, "content", None))
                 if not content:
-                    reasoning = self._normalize_message_text(getattr(message, "reasoning", None))
-                    if reasoning:
-                        raise RuntimeError(
-                            f"Ollama returned a reasoning-only response for model '{model_name}'."
-                        )
                     raise RuntimeError(f"Ollama returned an empty response for model '{model_name}'.")
-                return content.strip()
+                return self._validate_answer_citations(answer=content.strip(), mode=mode, retrieved_chunks=retrieved_chunks)
             except Exception as exc:
                 last_exc = exc
                 if (
@@ -819,18 +968,81 @@ class HybridGeospatialRAGPipeline:
                     or self._is_empty_response_error(exc)
                 ):
                     continue
-                raise RuntimeError(
-                    f"Ollama LLM call failed for model '{model_name}'. "
-                    f"Verify Ollama is running at {self.llm_base_url} and that the selected model "
-                    f"returns assistant content on the OpenAI-compatible chat endpoint. Error: {exc}"
-                ) from exc
+                return self._citation_failure_response(
+                    mode=mode,
+                    retrieved_chunks=retrieved_chunks,
+                    reason=f"llm_error:{exc}",
+                )
 
-        return self._fast_fallback_answer(
-            question=question,
+        return self._citation_failure_response(
+            mode=mode,
             retrieved_chunks=retrieved_chunks,
-            error=last_exc,
-            preferred_companies=preferred_companies or [],
+            reason=str(last_exc) if last_exc else "llm_unavailable",
         )
+
+    def _validate_answer_citations(self, answer: str, mode: str, retrieved_chunks: List[Dict[str, object]]) -> str:
+        stripped = answer.strip()
+        if not stripped:
+            return self._citation_failure_response(mode=mode, retrieved_chunks=retrieved_chunks, reason="empty answer")
+
+        lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+        bullets = [line for line in lines if re.match(r"^[-*]|\d+\.", line)]
+        check_lines = [line for line in bullets if not line.lower().startswith("evidence gaps:")]
+        if not check_lines:
+            check_lines = [line for line in lines if not line.lower().startswith("evidence gaps:")]
+
+        missing = [line for line in check_lines if not _CITATION_RE.search(line)]
+        if not missing:
+            return stripped
+        return self._citation_failure_response(mode=mode, retrieved_chunks=retrieved_chunks, reason="uncited bullets")
+
+    def _citation_failure_response(self, mode: str, retrieved_chunks: List[Dict[str, object]], reason: str) -> str:
+        if mode == "eval":
+            return (
+                "Abstaining because the final response could not be supported with citation-complete evidence. "
+                f"Reason: {reason}."
+            )
+        return self._deterministic_ui_fallback(retrieved_chunks=retrieved_chunks, reason=reason)
+
+    @staticmethod
+    def _deterministic_ui_fallback(retrieved_chunks: List[Dict[str, object]], reason: str) -> str:
+        if not retrieved_chunks:
+            return f"- No cited evidence was available. Reason: {reason}."
+        lines = [f"- Deterministic fallback summary because the narrated answer was rejected. Reason: {reason}. [{retrieved_chunks[0]['evidence_id']}]"]
+        for chunk in retrieved_chunks[:5]:
+            lines.append(f"- {chunk['text']} [{chunk['evidence_id']}]")
+        return "\n".join(lines)
+
+    def _choose_default_model(self) -> Optional[str]:
+        preferred = [
+            "qwen2.5:14b",
+            "qwen3:14b",
+            "gpt-oss:20b",
+            "mistral-small3.2:24b",
+            "llama3.1:8b",
+            "gemma3:12b",
+            "qwen3:8b",
+            "deepseek-r1:14b",
+            "deepseek-r1:8b",
+            "qwen3:4b",
+            "llama3.2:3b",
+            "gemma3:4b",
+            "tinyllama:latest",
+        ]
+        model_ids = self.available_models
+        if not model_ids:
+            return None
+        for candidate in preferred:
+            if candidate in model_ids:
+                return candidate
+        return model_ids[0]
+
+    def _list_available_models(self) -> List[str]:
+        try:
+            models = self.llm_client.models.list()
+            return [m.id for m in getattr(models, "data", []) if getattr(m, "id", None)]
+        except Exception:
+            return []
 
     def _oom_fallback_candidates(self, current_model: str) -> List[str]:
         available = [m for m in self.available_models if m != current_model]
@@ -882,96 +1094,19 @@ class HybridGeospatialRAGPipeline:
     @staticmethod
     def _is_memory_error(exc: Exception) -> bool:
         text = str(exc).lower()
-        memory_signals = [
-            "requires more system memory",
-            "out of memory",
-            "insufficient memory",
-            "cuda out of memory",
-        ]
-        return any(signal in text for signal in memory_signals)
+        return any(signal in text for signal in ["requires more system memory", "out of memory", "insufficient memory", "cuda out of memory"])
 
     @staticmethod
     def _is_model_unavailable_error(exc: Exception) -> bool:
         text = str(exc).lower()
-        signals = [
-            "model not found",
-            "pull model",
-            "does not exist",
-        ]
-        return any(signal in text for signal in signals)
+        return any(signal in text for signal in ["model not found", "pull model", "does not exist"])
 
     @staticmethod
     def _is_timeout_error(exc: Exception) -> bool:
         text = str(exc).lower()
-        signals = [
-            "timed out",
-            "readtimeout",
-            "apitimeouterror",
-        ]
-        return any(signal in text for signal in signals)
+        return any(signal in text for signal in ["timed out", "readtimeout", "apitimeouterror"])
 
     @staticmethod
     def _is_empty_response_error(exc: Exception) -> bool:
         text = str(exc).lower()
-        signals = [
-            "empty response",
-            "reasoning-only response",
-        ]
-        return any(signal in text for signal in signals)
-
-    @staticmethod
-    def _fast_fallback_answer(
-        question: str,
-        retrieved_chunks: List[Dict[str, object]],
-        error: Optional[Exception],
-        preferred_companies: Optional[List[str]] = None,
-    ) -> str:
-        if retrieved_chunks:
-            first_chunk = retrieved_chunks[0]
-            if first_chunk.get("chunk_type") == "geo_no_results":
-                return (
-                    f"{first_chunk.get('text')} [C1]\n"
-                    "Evidence Gaps: Ollama response timed out, so this answer is based on retrieval only."
-                )
-            if first_chunk.get("chunk_type") == "no_results":
-                return (
-                    f"{first_chunk.get('text')} [C1]\n"
-                    "Evidence Gaps: Ollama response timed out, and retrieval did not return supporting records."
-                )
-
-        companies: List[str] = []
-        citations: List[str] = []
-        preferred = [str(company) for company in (preferred_companies or []) if company]
-        if preferred:
-            companies = preferred[:4]
-            for chunk in retrieved_chunks:
-                cid = chunk.get("chunk_id")
-                if chunk.get("company") in companies and cid:
-                    citations.append(f"[{cid}]")
-                if len(citations) >= 2:
-                    break
-
-        if not companies:
-            for chunk in retrieved_chunks:
-                company = chunk.get("company")
-                cid = chunk.get("chunk_id")
-                if company and company not in companies:
-                    companies.append(str(company))
-                if cid:
-                    citations.append(f"[{cid}]")
-                if len(companies) >= 4 and len(citations) >= 2:
-                    break
-
-        if companies:
-            refs = " ".join(citations[:2]) if citations else ""
-            items = ", ".join(companies[:4])
-            return (
-                f"Top matches based on retrieved evidence for '{question}': {items}. "
-                f"{refs}\nEvidence Gaps: Ollama response timed out, so this is a fast fallback summary."
-            )
-
-        return (
-            f"I could not generate a model answer in time for '{question}'. "
-            "No high-confidence chunks were available. "
-            "Evidence Gaps: backend fell back due Ollama timeout."
-        )
+        return any(signal in text for signal in ["empty response", "reasoning-only response"])

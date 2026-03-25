@@ -1,0 +1,43 @@
+{
+  "COUNTY_FIELD_TRUSTED": false,
+  "join_key_used": "company+location exact match, then company fallback",
+  "row_count": 2,
+  "join_match_rate": 0.5,
+  "join_match_count": 1,
+  "duplicate_key_rate": 0.0,
+  "duplicate_key_counts": {
+    "exact_duplicate_keys": 0,
+    "exact_unique_keys": 1,
+    "company_duplicate_keys": 0,
+    "company_unique_keys": 1
+  },
+  "usable_coordinate_rows": 1,
+  "outside_ga_rate": 0.0,
+  "outside_ga_count": 0,
+  "unassignable_rate": 0.0,
+  "unassignable_count": 0,
+  "mismatch_rate": 0.0,
+  "mismatch_count": 0,
+  "mismatch_denominator": 2,
+  "county_polygon_repair_count": 0,
+  "county_polygon_repair_counties": [],
+  "county_geometry_hash": "033042f1c81b29754c5e4cc9a32eca5c1dcdba8505d872f4bf4a98214e1805d1",
+  "configured_crs": "EPSG:5070",
+  "thresholds": {
+    "join_match_rate_min": 0.99,
+    "duplicate_key_rate_max": 0.5,
+    "outside_ga_rate_max": 1.0,
+    "unassignable_rate_max": 1.0,
+    "mismatch_rate_max": 0.05
+  },
+  "coordinate_workbook_label": "company_coordinates.xlsx::Sheet1",
+  "coordinate_workbook_found": true,
+  "excel_path": "C:\\Users\\Yes\\AppData\\Local\\Temp\\pytest-of-Yes\\pytest-1\\test_ingestion_gate_fails_when0\\gnem_companies.xlsx",
+  "geojson_path": "C:\\Users\\Yes\\Desktop\\GEOJSON_MAP_VIEW\\GEOJSON_MAP_VIEW\\tests\\data\\sample_counties.geojson",
+  "coordinate_workbook": "C:\\Users\\Yes\\AppData\\Local\\Temp\\pytest-of-Yes\\pytest-1\\test_ingestion_gate_fails_when0\\company_coordinates.xlsx",
+  "excel_file_hash": "70477b20c8f6bf481dae95b8c7a5d435bad1e19507fb730bf7d8dc2ab3c02a0e",
+  "geojson_file_hash": "43b09244e03eb6f1edf91bdd9a2f3d9d9018423495d83278b410a5aad4428b74",
+  "coordinate_workbook_hash": "d63907d16d33bef75070c576b966fd906d6b653b21015bc6844ccc734ed113cc",
+  "embedding_backend": null,
+  "embedding_model": null
+}

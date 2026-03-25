@@ -1,0 +1,35 @@
+{
+  "COUNTY_FIELD_TRUSTED": false,
+  "join_key_used": "company+location exact match, then company fallback",
+  "row_count": 2,
+  "join_match_rate": 0.5,
+  "join_match_count": 1,
+  "duplicate_key_rate": 0.0,
+  "duplicate_key_counts": {
+    "exact_duplicate_keys": 0,
+    "exact_unique_keys": 1,
+    "company_duplicate_keys": 0,
+    "company_unique_keys": 1
+  },
+  "usable_coordinate_rows": 1,
+  "outside_ga_rate": 0.0,
+  "outside_ga_count": 0,
+  "unassignable_rate": 0.0,
+  "unassignable_count": 0,
+  "mismatch_rate": 0.0,
+  "mismatch_count": 0,
+  "mismatch_denominator": 2,
+  "county_polygon_repair_count": 0,
+  "county_polygon_repair_counties": [],
+  "county_geometry_hash": "033042f1c81b29754c5e4cc9a32eca5c1dcdba8505d872f4bf4a98214e1805d1",
+  "configured_crs": "EPSG:5070",
+  "thresholds": {
+    "join_match_rate_min": 0.99,
+    "duplicate_key_rate_max": 0.5,
+    "outside_ga_rate_max": 1.0,
+    "unassignable_rate_max": 1.0,
+    "mismatch_rate_max": 0.05
+  },
+  "coordinate_workbook_label": "company_coordinates.xlsx::Sheet1",
+  "coordinate_workbook_found": true
+}

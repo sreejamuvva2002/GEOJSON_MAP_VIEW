@@ -1,0 +1,3 @@
+row_index,company,location,existing_county,computed_county,join_key_used,exact_join_key,company_key,join_status,coordinate_source_file,coordinate_source_sheet,coordinate_company,coordinate_location,coordinate_address,coordinate_city,coordinate_county,latitude,longitude,outside_georgia_polygon,unassignable_county,county_mismatch
+0,Alpha Inside,"Alpha City, Alpha County",Alpha,Alpha,company+location,alpha inside||alpha city alpha county,alpha inside,matched_exact,company_coordinates.xlsx,Sheet1,Alpha Inside,"Alpha City, Alpha County",,,,32.5,-83.5,False,False,False
+1,Missing Join,"Beta City, Beta County",Beta,,company+location_then_company,missing join||beta city beta county,missing join,no_join_match,,,,,,,,,,False,False,False

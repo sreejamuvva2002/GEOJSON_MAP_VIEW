@@ -3,14 +3,25 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import duckdb
 import faiss
 import numpy as np
 import pandas as pd
+
+from backend.geo_utils import (
+    PROJECTED_CRS,
+    canonical_county_display_name,
+    compute_county_for_point,
+    file_sha256,
+    load_county_geometries,
+    normalize_county_name,
+    stable_company_slug,
+)
 
 DEFAULT_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 EMBED_DIMENSION = 384
@@ -23,13 +34,22 @@ DEFAULT_COORDINATE_EXCEL_PATH = DATA_DIR / "company_coordinates.xlsx"
 DEFAULT_DB_PATH = DATA_DIR / "gnem.duckdb"
 DEFAULT_FAISS_PATH = DATA_DIR / "gnem_faiss.index"
 DEFAULT_METADATA_PATH = DATA_DIR / "vector_metadata.json"
+DEFAULT_JOIN_AUDIT_PATH = DATA_DIR / "coordinate_join_audit.csv"
+DEFAULT_JOIN_AUDIT_JSON_PATH = DATA_DIR / "join_audit.json"
+DEFAULT_GEO_VALIDATION_PATH = DATA_DIR / "geo_validation_report.csv"
+DEFAULT_INGESTION_METADATA_PATH = DATA_DIR / "ingestion_run_metadata.json"
 
 COMPANY_COLUMN_CANDIDATES = ["company", "company_name", "supplier", "supplier_name", "name"]
 LOCATION_COLUMN_CANDIDATES = ["location", "facility_location", "address", "city_county", "site"]
 CITY_COLUMN_CANDIDATES = ["city", "municipality", "town"]
 COUNTY_COLUMN_CANDIDATES = ["county", "county_name"]
+ADDRESS_COLUMN_CANDIDATES = ["address", "street_address"]
 LATITUDE_COLUMN_CANDIDATES = ["latitude", "lat", "facility_latitude", "y"]
 LONGITUDE_COLUMN_CANDIDATES = ["longitude", "lon", "lng", "long", "facility_longitude", "x"]
+
+
+class IngestionGateError(RuntimeError):
+    pass
 
 
 def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -57,74 +77,38 @@ def normalize_match_key(value: object) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def extract_city_county(location: object) -> Tuple[Optional[str], Optional[str]]:
-    if pd.isna(location):
-        return None, None
+def extract_city_county(location: object, explicit_county: object = None) -> Tuple[Optional[str], Optional[str]]:
+    location_text = normalize_cell(location)
+    county_text = normalize_cell(explicit_county)
 
-    text = str(location).strip()
-    if not text:
-        return None, None
+    city = None
+    county = canonical_county_display_name(county_text) if county_text else None
+    if not location_text:
+        return city, county
 
-    parts = [p.strip() for p in text.split(",") if p.strip()]
-    city = parts[0].title() if parts else None
+    parts = [part.strip() for part in location_text.split(",") if part.strip()]
+    if parts:
+        first = parts[0]
+        if "county" not in first.lower():
+            city = first.title()
 
-    county_match = re.search(r"([A-Za-z][A-Za-z\s\-']+?)\s+County", text, flags=re.IGNORECASE)
-    county = county_match.group(1).strip().title() if county_match else None
-
-    if not county and len(parts) > 1:
-        maybe_county = parts[1].replace("County", "").strip()
-        county = maybe_county.title() if maybe_county else None
+    if county is None:
+        county_match = re.search(r"([A-Za-z][A-Za-z\s\-'.&]+?)\s+County\b", location_text, flags=re.IGNORECASE)
+        if county_match:
+            county = canonical_county_display_name(county_match.group(1))
+        elif len(parts) > 1 and "county" in parts[1].lower():
+            county = canonical_county_display_name(parts[1])
 
     return city, county
 
 
-def _iter_coordinates(geometry: dict) -> Iterable[Tuple[float, float]]:
-    geom_type = geometry.get("type")
-    coords = geometry.get("coordinates", [])
-
-    if geom_type == "Polygon":
-        for ring in coords:
-            for lon, lat in ring:
-                yield float(lat), float(lon)
-    elif geom_type == "MultiPolygon":
-        for polygon in coords:
-            for ring in polygon:
-                for lon, lat in ring:
-                    yield float(lat), float(lon)
-
-
-def _mean_lat_lon(points: List[Tuple[float, float]]) -> Optional[Tuple[float, float]]:
-    if not points:
-        return None
-    arr = np.array(points, dtype=np.float32)
-    lat = float(arr[:, 0].mean())
-    lon = float(arr[:, 1].mean())
-    return lat, lon
+def load_county_polygons(geojson_path: Path):
+    return load_county_geometries(geojson_path)
 
 
 def load_county_centroids(geojson_path: Path) -> Dict[str, Tuple[float, float]]:
-    with geojson_path.open("r", encoding="utf-8") as f:
-        payload = json.load(f)
-
-    centroids: Dict[str, Tuple[float, float]] = {}
-    for feature in payload.get("features", []):
-        props = feature.get("properties", {})
-        geometry = feature.get("geometry", {})
-        points = list(_iter_coordinates(geometry))
-        centroid = _mean_lat_lon(points)
-        if not centroid:
-            continue
-
-        county_name = (
-            props.get("NAME10")
-            or props.get("NAME")
-            or props.get("NAMELSAD10", "").replace("County", "").strip()
-        )
-        if county_name:
-            key = str(county_name).strip().lower()
-            centroids[key] = centroid
-
-    return centroids
+    county_index = load_county_polygons(geojson_path)
+    return county_index.centroid_lookup
 
 
 def _safe_float(value: object) -> Optional[float]:
@@ -161,6 +145,7 @@ def _detect_coordinate_columns(df: pd.DataFrame) -> Optional[Dict[str, str]]:
         "location": LOCATION_COLUMN_CANDIDATES,
         "city": CITY_COLUMN_CANDIDATES,
         "county": COUNTY_COLUMN_CANDIDATES,
+        "address": ADDRESS_COLUMN_CANDIDATES,
     }
     for key, candidates in optional_pairs.items():
         optional_col = _find_first_present(cols, candidates)
@@ -174,6 +159,7 @@ def discover_coordinate_workbook(explicit_path: Path = DEFAULT_COORDINATE_EXCEL_
         return explicit_path
 
     preferred_names = [
+        "GNEM - Auto Landscape Lat Long Updated.xlsx",
         "GNEM - Auto Landscape Lat Long Updated File (1).xlsx",
         "company_coordinates.xlsx",
     ]
@@ -219,7 +205,7 @@ def load_coordinate_enrichment(workbook_path: Optional[Path]) -> Tuple[pd.DataFr
             detected["latitude"]: "coord_latitude",
             detected["longitude"]: "coord_longitude",
         }
-        for optional_key in ("location", "city", "county"):
+        for optional_key in ("location", "city", "county", "address"):
             optional_col = detected.get(optional_key)
             if optional_col:
                 rename_map[optional_col] = f"coord_{optional_key}"
@@ -228,17 +214,26 @@ def load_coordinate_enrichment(workbook_path: Optional[Path]) -> Tuple[pd.DataFr
         keep_cols = [col for col in coords.columns if col.startswith("coord_")]
         coords = coords[keep_cols].copy()
         coords["coord_company_key"] = coords["coord_company"].apply(normalize_match_key)
-        if "coord_location" in coords.columns:
-            coords["coord_location_key"] = coords["coord_location"].apply(normalize_match_key)
-        else:
-            coords["coord_location_key"] = ""
+        coords["coord_location_key"] = (
+            coords["coord_location"].apply(normalize_match_key) if "coord_location" in coords.columns else ""
+        )
+        coords["coord_city_key"] = coords["coord_city"].apply(normalize_match_key) if "coord_city" in coords.columns else ""
+        coords["coord_county_key"] = (
+            coords["coord_county"].apply(normalize_county_name) if "coord_county" in coords.columns else None
+        )
+        coords["coord_address_key"] = (
+            coords["coord_address"].apply(normalize_match_key) if "coord_address" in coords.columns else ""
+        )
+        coords["coord_exact_join_key"] = coords.apply(
+            lambda row: f"{row['coord_company_key']}||{row['coord_location_key']}" if row["coord_location_key"] else "",
+            axis=1,
+        )
 
         coords["coord_latitude"] = pd.to_numeric(coords["coord_latitude"], errors="coerce")
         coords["coord_longitude"] = pd.to_numeric(coords["coord_longitude"], errors="coerce")
         coords = coords.dropna(subset=["coord_latitude", "coord_longitude"]).copy()
         coords = coords[
-            (coords["coord_latitude"].between(-90, 90))
-            & (coords["coord_longitude"].between(-180, 180))
+            coords["coord_latitude"].between(-90, 90) & coords["coord_longitude"].between(-180, 180)
         ].copy()
         if coords.empty:
             continue
@@ -250,18 +245,107 @@ def load_coordinate_enrichment(workbook_path: Optional[Path]) -> Tuple[pd.DataFr
     return pd.DataFrame(), None
 
 
+def _build_unique_lookup(df: pd.DataFrame, key_column: str) -> Tuple[Dict[str, dict], set[str]]:
+    if df.empty or key_column not in df.columns:
+        return {}, set()
+
+    keyed = df[df[key_column].fillna("").astype(str).str.strip() != ""].copy()
+    if keyed.empty:
+        return {}, set()
+
+    grouped = keyed.groupby(key_column, dropna=False)
+    duplicate_keys = {str(key) for key, group in grouped if len(group) > 1}
+    unique_lookup: Dict[str, dict] = {}
+    for key, group in grouped:
+        key_text = str(key)
+        if key_text in duplicate_keys:
+            continue
+        unique_lookup[key_text] = group.iloc[0].to_dict()
+    return unique_lookup, duplicate_keys
+
+
+def _coordinate_duplicate_rate(coordinate_df: pd.DataFrame) -> Tuple[float, Dict[str, int]]:
+    if coordinate_df.empty:
+        return 0.0, {
+            "exact_duplicate_keys": 0,
+            "exact_unique_keys": 0,
+            "company_duplicate_keys": 0,
+            "company_unique_keys": 0,
+        }
+
+    exact_series = coordinate_df["coord_exact_join_key"].fillna("").astype(str)
+    exact_series = exact_series[exact_series != ""]
+    company_series = coordinate_df["coord_company_key"].fillna("").astype(str)
+    company_series = company_series[company_series != ""]
+
+    exact_duplicate_keys = int(exact_series.value_counts().gt(1).sum()) if not exact_series.empty else 0
+    exact_unique_keys = int(exact_series.nunique()) if not exact_series.empty else 0
+    company_duplicate_keys = int(company_series.value_counts().gt(1).sum()) if not company_series.empty else 0
+    company_unique_keys = int(company_series.nunique()) if not company_series.empty else 0
+
+    denominator = max(1, exact_unique_keys + company_unique_keys)
+    duplicate_key_rate = (exact_duplicate_keys + company_duplicate_keys) / denominator
+    return duplicate_key_rate, {
+        "exact_duplicate_keys": exact_duplicate_keys,
+        "exact_unique_keys": exact_unique_keys,
+        "company_duplicate_keys": company_duplicate_keys,
+        "company_unique_keys": company_unique_keys,
+    }
+
+
+def _join_audit_summary(
+    *,
+    join_audit_df: pd.DataFrame,
+    usable_coordinates: pd.Series,
+    outside_flags: pd.Series,
+    unassignable_flags: pd.Series,
+    mismatch_flags: pd.Series,
+    county_field_trusted: bool,
+    duplicate_key_rate: float,
+    duplicate_key_counts: Dict[str, int],
+    county_index,
+    join_key_used: str,
+) -> Dict[str, object]:
+    total_rows = max(1, len(join_audit_df))
+    coordinate_join_mask = join_audit_df["join_status"].isin({"matched_exact", "matched_company_fallback"})
+    matched_rows = int(coordinate_join_mask.sum())
+
+    usable_count = int(usable_coordinates.sum())
+    outside_count = int(outside_flags.sum())
+    unassignable_count = int(unassignable_flags.sum())
+    mismatch_count = int(mismatch_flags.sum())
+    mismatch_denominator = int((join_audit_df["existing_county"].fillna("") != "").sum())
+
+    return {
+        "COUNTY_FIELD_TRUSTED": county_field_trusted,
+        "join_key_used": join_key_used,
+        "row_count": int(len(join_audit_df)),
+        "join_match_rate": matched_rows / total_rows,
+        "join_match_count": matched_rows,
+        "duplicate_key_rate": duplicate_key_rate,
+        "duplicate_key_counts": duplicate_key_counts,
+        "usable_coordinate_rows": usable_count,
+        "outside_ga_rate": (outside_count / usable_count) if usable_count else 0.0,
+        "outside_ga_count": outside_count,
+        "unassignable_rate": (unassignable_count / usable_count) if usable_count else 0.0,
+        "unassignable_count": unassignable_count,
+        "mismatch_rate": (mismatch_count / mismatch_denominator) if mismatch_denominator else 0.0,
+        "mismatch_count": mismatch_count,
+        "mismatch_denominator": mismatch_denominator,
+        "county_polygon_repair_count": county_index.repair_count,
+        "county_polygon_repair_counties": county_index.repaired_counties,
+        "county_geometry_hash": county_index.geometry_hash,
+        "configured_crs": PROJECTED_CRS,
+    }
+
+
 def attach_coordinates(
     df: pd.DataFrame,
-    county_centroids: Dict[str, Tuple[float, float]],
+    county_index,
     coordinate_df: Optional[pd.DataFrame] = None,
-) -> pd.DataFrame:
+    county_field_trusted: bool = False,
+) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, object]]:
     out = df.copy()
-    cities: List[Optional[str]] = []
-    counties: List[Optional[str]] = []
-    lats: List[Optional[float]] = []
-    lons: List[Optional[float]] = []
-    sources: List[str] = []
-
     if "latitude" in out.columns:
         out["latitude"] = pd.to_numeric(out["latitude"], errors="coerce")
     else:
@@ -271,140 +355,196 @@ def attach_coordinates(
     else:
         out["longitude"] = np.nan
 
-    out["company_key"] = out.get("company", "").apply(normalize_match_key)
-    out["location_key"] = out.get("location", "").apply(normalize_match_key)
+    source_cities: List[Optional[str]] = []
+    source_counties: List[Optional[str]] = []
+    join_rows: List[Dict[str, object]] = []
+    computed_counties: List[Optional[str]] = []
+    county_keys: List[Optional[str]] = []
+    county_ids: List[Optional[str]] = []
+    county_fips: List[Optional[str]] = []
+    latitude_values: List[Optional[float]] = []
+    longitude_values: List[Optional[float]] = []
+    coordinate_sources: List[str] = []
+    outside_flags: List[bool] = []
+    unassignable_flags: List[bool] = []
+    mismatch_flags: List[bool] = []
+    quarantine_reasons: List[str] = []
+    geo_validated_flags: List[bool] = []
 
-    exact_coords = pd.DataFrame()
-    company_coords = pd.DataFrame()
+    exact_lookup: Dict[str, dict] = {}
+    exact_duplicate_keys: set[str] = set()
+    company_lookup: Dict[str, dict] = {}
+    company_duplicate_keys: set[str] = set()
+    duplicate_key_rate = 0.0
+    duplicate_key_counts: Dict[str, int] = {
+        "exact_duplicate_keys": 0,
+        "exact_unique_keys": 0,
+        "company_duplicate_keys": 0,
+        "company_unique_keys": 0,
+    }
+
     if coordinate_df is not None and not coordinate_df.empty:
-        exact_coords = coordinate_df[coordinate_df["coord_location_key"] != ""].copy()
-        exact_coords = exact_coords.sort_values(["coord_company_key", "coord_location_key"]).drop_duplicates(
-            subset=["coord_company_key", "coord_location_key"],
-            keep="first",
-        )
-        company_coords = coordinate_df.sort_values(["coord_company_key"]).drop_duplicates(
-            subset=["coord_company_key"],
-            keep="first",
-        )
-        out = out.merge(
-            exact_coords[
-                [
-                    "coord_company_key",
-                    "coord_location_key",
-                    "coord_latitude",
-                    "coord_longitude",
-                    "coordinate_source_file",
-                    "coordinate_source_sheet",
-                ]
-            ].rename(
-                columns={
-                    "coord_company_key": "exact_company_key",
-                    "coord_location_key": "exact_location_key",
-                    "coord_latitude": "exact_latitude",
-                    "coord_longitude": "exact_longitude",
-                    "coordinate_source_file": "exact_coordinate_source_file",
-                    "coordinate_source_sheet": "exact_coordinate_source_sheet",
-                }
-            ),
-            left_on=["company_key", "location_key"],
-            right_on=["exact_company_key", "exact_location_key"],
-            how="left",
-        )
-        out = out.merge(
-            company_coords[
-                [
-                    "coord_company_key",
-                    "coord_latitude",
-                    "coord_longitude",
-                    "coordinate_source_file",
-                    "coordinate_source_sheet",
-                    *([c for c in ["coord_city", "coord_county"] if c in company_coords.columns]),
-                ]
-            ].rename(
-                columns={
-                    "coord_company_key": "company_coord_key",
-                    "coord_latitude": "company_latitude",
-                    "coord_longitude": "company_longitude",
-                    "coordinate_source_file": "company_coordinate_source_file",
-                    "coordinate_source_sheet": "company_coordinate_source_sheet",
-                    "coord_city": "company_coord_city",
-                    "coord_county": "company_coord_county",
-                }
-            ),
-            left_on="company_key",
-            right_on="company_coord_key",
-            how="left",
-        )
+        exact_lookup, exact_duplicate_keys = _build_unique_lookup(coordinate_df, "coord_exact_join_key")
+        company_lookup, company_duplicate_keys = _build_unique_lookup(coordinate_df, "coord_company_key")
+        duplicate_key_rate, duplicate_key_counts = _coordinate_duplicate_rate(coordinate_df)
 
-    for _, row in out.iterrows():
-        city, county = extract_city_county(row.get("location"))
-        explicit_city = normalize_cell(row.get("company_coord_city"))
-        explicit_county = normalize_cell(row.get("company_coord_county"))
-        if not city and explicit_city:
-            city = explicit_city.title()
-        if not county and explicit_county:
-            county = explicit_county.title()
-        cities.append(city)
-        counties.append(county)
+    for row_idx, (_, row) in enumerate(out.iterrows()):
+        explicit_county = row.get("county")
+        city, existing_county = extract_city_county(row.get("location"), explicit_county=explicit_county)
+        source_cities.append(city)
+        source_counties.append(existing_county)
+
+        company_name = normalize_cell(row.get("company"))
+        location_text = normalize_cell(row.get("location"))
+        company_key = normalize_match_key(company_name)
+        location_key = normalize_match_key(location_text)
+        exact_join_key = f"{company_key}||{location_key}" if location_key else ""
 
         lat = _safe_float(row.get("latitude"))
         lon = _safe_float(row.get("longitude"))
-        source = "source_excel" if lat is not None and lon is not None else "missing"
-
-        exact_lat = _safe_float(row.get("exact_latitude"))
-        exact_lon = _safe_float(row.get("exact_longitude"))
-        company_lat = _safe_float(row.get("company_latitude"))
-        company_lon = _safe_float(row.get("company_longitude"))
-        if lat is None or lon is None:
-            if exact_lat is not None and exact_lon is not None:
-                lat, lon = exact_lat, exact_lon
-                source = f"coordinates_excel:{normalize_cell(row.get('exact_coordinate_source_file')) or 'external'}"
-            elif company_lat is not None and company_lon is not None:
-                lat, lon = company_lat, company_lon
-                source = f"coordinates_excel:{normalize_cell(row.get('company_coordinate_source_file')) or 'external'}"
-
-        if (lat is None or lon is None) and county:
-            county_key = county.strip().lower()
-            if county_key in county_centroids:
-                lat, lon = county_centroids[county_key]
-                source = "county_centroid"
+        join_status = "source_coordinates"
+        join_method = "source"
+        join_record = None
+        coordinate_source = "source_excel" if lat is not None and lon is not None else "missing"
 
         if lat is None or lon is None:
-            source = "missing"
+            join_status = "not_attempted"
+            join_method = "missing"
+            if exact_join_key and exact_join_key in exact_lookup:
+                join_record = exact_lookup[exact_join_key]
+                lat = _safe_float(join_record.get("coord_latitude"))
+                lon = _safe_float(join_record.get("coord_longitude"))
+                join_status = "matched_exact"
+                join_method = "company+location"
+            elif exact_join_key and exact_join_key in exact_duplicate_keys:
+                join_status = "duplicate_exact_key"
+                join_method = "company+location"
+            elif company_key and company_key in company_lookup:
+                join_record = company_lookup[company_key]
+                lat = _safe_float(join_record.get("coord_latitude"))
+                lon = _safe_float(join_record.get("coord_longitude"))
+                join_status = "matched_company_fallback"
+                join_method = "company"
+            elif company_key and company_key in company_duplicate_keys:
+                join_status = "duplicate_company_key"
+                join_method = "company"
+            else:
+                join_status = "no_join_match"
+                join_method = "company+location_then_company"
 
-        lats.append(lat)
-        lons.append(lon)
-        sources.append(source)
+            if lat is not None and lon is not None:
+                coordinate_source = (
+                    f"coordinates_excel:{normalize_cell(join_record.get('coordinate_source_file')) or 'external'}"
+                    if join_record
+                    else "source_excel"
+                )
 
-    out["city"] = cities
-    out["county"] = counties
-    out["latitude"] = lats
-    out["longitude"] = lons
-    out["coordinate_source"] = sources
-    drop_cols = [
-        "company_key",
-        "location_key",
-        "exact_company_key",
-        "exact_location_key",
-        "exact_latitude",
-        "exact_longitude",
-        "exact_coordinate_source_file",
-        "exact_coordinate_source_sheet",
-        "company_coord_key",
-        "company_latitude",
-        "company_longitude",
-        "company_coordinate_source_file",
-        "company_coordinate_source_sheet",
-        "company_coord_city",
-        "company_coord_county",
-    ]
-    existing_drop_cols = [col for col in drop_cols if col in out.columns]
-    return out.drop(columns=existing_drop_cols)
+        usable_coordinates = lat is not None and lon is not None and -90 <= lat <= 90 and -180 <= lon <= 180
+        latitude_values.append(lat if usable_coordinates else None)
+        longitude_values.append(lon if usable_coordinates else None)
+
+        computed_county = None
+        county_key = None
+        county_id = None
+        county_fips_value = None
+        outside_flag = False
+        unassignable_flag = False
+        geo_validated = False
+        quarantine_reason = ""
+
+        if usable_coordinates:
+            county_match = compute_county_for_point(county_index, latitude=lat, longitude=lon)
+            if county_match is None:
+                outside_flag = True
+                unassignable_flag = True
+                quarantine_reason = "outside_georgia_polygon"
+            else:
+                computed_county = county_match.county_name
+                county_key = county_match.county_key
+                county_id = county_match.county_id
+                county_fips_value = county_match.county_fips
+                geo_validated = True
+
+        existing_county_key = normalize_county_name(existing_county)
+        mismatch_flag = bool(
+            county_field_trusted
+            and existing_county_key
+            and county_key
+            and existing_county_key != county_key
+        )
+
+        coordinate_sources.append(coordinate_source if usable_coordinates else "missing")
+        computed_counties.append(computed_county)
+        county_keys.append(county_key if county_key else existing_county_key)
+        county_ids.append(county_id)
+        county_fips.append(county_fips_value)
+        outside_flags.append(outside_flag)
+        unassignable_flags.append(unassignable_flag)
+        mismatch_flags.append(mismatch_flag)
+        quarantine_reasons.append(quarantine_reason)
+        geo_validated_flags.append(geo_validated)
+
+        join_rows.append(
+            {
+                "row_index": row_idx,
+                "company": company_name,
+                "location": location_text,
+                "existing_county": existing_county,
+                "computed_county": computed_county,
+                "join_key_used": join_method,
+                "exact_join_key": exact_join_key,
+                "company_key": company_key,
+                "join_status": join_status,
+                "coordinate_source_file": normalize_cell(join_record.get("coordinate_source_file")) if join_record else "",
+                "coordinate_source_sheet": normalize_cell(join_record.get("coordinate_source_sheet")) if join_record else "",
+                "coordinate_company": normalize_cell(join_record.get("coord_company")) if join_record else "",
+                "coordinate_location": normalize_cell(join_record.get("coord_location")) if join_record else "",
+                "coordinate_address": normalize_cell(join_record.get("coord_address")) if join_record else "",
+                "coordinate_city": normalize_cell(join_record.get("coord_city")) if join_record else "",
+                "coordinate_county": canonical_county_display_name(join_record.get("coord_county")) if join_record else "",
+                "latitude": lat if usable_coordinates else None,
+                "longitude": lon if usable_coordinates else None,
+                "outside_georgia_polygon": outside_flag,
+                "unassignable_county": unassignable_flag,
+                "county_mismatch": mismatch_flag,
+            }
+        )
+
+    out["city"] = source_cities
+    out["existing_county"] = source_counties
+    out["computed_county"] = computed_counties
+    out["county"] = [computed if computed else existing for computed, existing in zip(computed_counties, source_counties)]
+    out["county_key"] = county_keys
+    out["county_id"] = county_ids
+    out["county_fips"] = county_fips
+    out["latitude"] = latitude_values
+    out["longitude"] = longitude_values
+    out["coordinate_source"] = coordinate_sources
+    out["outside_georgia_polygon"] = outside_flags
+    out["unassignable_county"] = unassignable_flags
+    out["county_mismatch"] = mismatch_flags
+    out["geo_quarantine_reason"] = quarantine_reasons
+    out["geo_validated"] = geo_validated_flags
+
+    join_audit_df = pd.DataFrame(join_rows)
+    usable_coordinates_series = out["latitude"].notna() & out["longitude"].notna()
+    summary = _join_audit_summary(
+        join_audit_df=join_audit_df,
+        usable_coordinates=usable_coordinates_series,
+        outside_flags=out["outside_georgia_polygon"],
+        unassignable_flags=out["unassignable_county"],
+        mismatch_flags=out["county_mismatch"],
+        county_field_trusted=county_field_trusted,
+        duplicate_key_rate=duplicate_key_rate,
+        duplicate_key_counts=duplicate_key_counts,
+        county_index=county_index,
+        join_key_used="company+location exact match, then company fallback",
+    )
+    return out, join_audit_df, summary
 
 
 def _company_slug(company: str, fallback_idx: int) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "-", company.lower()).strip("-")
-    return slug or f"company-{fallback_idx}"
+    return stable_company_slug(company, fallback=f"company-{fallback_idx}")
 
 
 def build_chunk_records(df: pd.DataFrame) -> List[dict]:
@@ -425,10 +565,13 @@ def build_chunk_records(df: pd.DataFrame) -> List[dict]:
         classification = normalize_cell(row.get("classification_method"))
         city = normalize_cell(row.get("city"))
         county = normalize_cell(row.get("county"))
+        computed_county = normalize_cell(row.get("computed_county"))
         employment = _safe_float(row.get("employment"))
         latitude = _safe_float(row.get("latitude"))
         longitude = _safe_float(row.get("longitude"))
         coordinate_source = normalize_cell(row.get("coordinate_source"))
+        county_fips = normalize_cell(row.get("county_fips"))
+        geo_validated = bool(row.get("geo_validated"))
 
         base = {
             "company": company,
@@ -437,6 +580,8 @@ def build_chunk_records(df: pd.DataFrame) -> List[dict]:
             "location": location,
             "city": city,
             "county": county,
+            "computed_county": computed_county,
+            "county_fips": county_fips,
             "ev_supply_chain_role": ev_role,
             "primary_oems": primary_oems,
             "supplier_or_affiliation_type": affiliation_type,
@@ -448,8 +593,9 @@ def build_chunk_records(df: pd.DataFrame) -> List[dict]:
             "latitude": latitude,
             "longitude": longitude,
             "coordinate_source": coordinate_source,
+            "geo_validated": geo_validated,
             "row_index": int(row_idx),
-            "source_dataset": "GNEM updated excel.xlsx",
+            "source_dataset": "gnem_companies.xlsx",
         }
 
         chunk_templates = {
@@ -483,9 +629,12 @@ def build_chunk_records(df: pd.DataFrame) -> List[dict]:
                 f"Location: {location}\n"
                 f"City: {city}\n"
                 f"County: {county}\n"
+                f"Computed County: {computed_county or 'unknown'}\n"
+                f"County FIPS: {county_fips or 'unknown'}\n"
                 f"Latitude: {latitude if latitude is not None else 'unknown'}\n"
                 f"Longitude: {longitude if longitude is not None else 'unknown'}\n"
                 f"Coordinate Source: {coordinate_source or 'unknown'}\n"
+                f"Geo Validated: {geo_validated}\n"
                 f"Employment: {int(employment) if employment is not None else 'unknown'}"
             ),
         }
@@ -522,14 +671,12 @@ def create_embeddings(
     docs: List[str],
     model_name: str = DEFAULT_MODEL_NAME,
 ) -> Tuple[np.ndarray, str, str]:
-    import os
-
     backend_pref = os.getenv("EMBEDDING_BACKEND", "hash").strip().lower()
-    if backend_pref not in {"sentence-transformers", "sbert", "sentence"}:
-        fallback = np.vstack([_hash_embed_one(doc) for doc in docs]).astype(np.float32)
-        return fallback, "hash-fallback", "hashed-token-384"
+    if backend_pref == "hash":
+        embeddings = np.vstack([_hash_embed_one(doc) for doc in docs]).astype(np.float32)
+        return embeddings, "hash", "hashed-token-384"
 
-    try:
+    if backend_pref in {"sentence-transformers", "sbert", "sentence"}:
         from sentence_transformers import SentenceTransformer
 
         local_only = os.getenv("EMBEDDING_LOCAL_ONLY", "true").strip().lower() == "true"
@@ -541,10 +688,10 @@ def create_embeddings(
             show_progress_bar=True,
         ).astype(np.float32)
         return embeddings, "sentence-transformers", model_name
-    except Exception as exc:
-        print(f"[ingestion] Embedding model unavailable, using hash fallback: {exc}")
-        fallback = np.vstack([_hash_embed_one(doc) for doc in docs]).astype(np.float32)
-        return fallback, "hash-fallback", "hashed-token-384"
+
+    raise ValueError(
+        "Unsupported EMBEDDING_BACKEND. Use 'hash' or 'sentence-transformers' for deterministic indexing."
+    )
 
 
 def write_duckdb(df: pd.DataFrame, db_path: Path) -> None:
@@ -555,12 +702,94 @@ def write_duckdb(df: pd.DataFrame, db_path: Path) -> None:
 
 
 def write_company_chunks_duckdb(chunk_records: List[dict], db_path: Path) -> None:
-    if not chunk_records:
-        return
     with duckdb.connect(str(db_path)) as con:
         chunk_df = pd.DataFrame(chunk_records)
         con.register("df_company_chunks", chunk_df)
         con.execute("CREATE OR REPLACE TABLE company_chunks AS SELECT * FROM df_company_chunks")
+
+
+def write_county_tables(db_path: Path, county_index, quarantine_df: pd.DataFrame) -> None:
+    county_rows = [
+        {
+            "county_id": county.county_id,
+            "county_name": county.county_name,
+            "county_key": county.county_key,
+            "county_fips": county.county_fips,
+            "geoid": county.geoid,
+            "centroid_latitude": county.centroid_latitude,
+            "centroid_longitude": county.centroid_longitude,
+            "repair_applied": county.repair_applied,
+            "repair_method": county.repair_method,
+        }
+        for county in county_index.counties
+    ]
+    county_df = pd.DataFrame(county_rows)
+
+    with duckdb.connect(str(db_path)) as con:
+        con.register("df_counties", county_df)
+        con.execute("CREATE OR REPLACE TABLE county_dimension AS SELECT * FROM df_counties")
+
+        con.register("df_quarantine", quarantine_df if not quarantine_df.empty else pd.DataFrame({"placeholder": []}))
+        if quarantine_df.empty:
+            con.execute("CREATE OR REPLACE TABLE geo_quarantine AS SELECT * FROM df_quarantine LIMIT 0")
+        else:
+            con.execute("CREATE OR REPLACE TABLE geo_quarantine AS SELECT * FROM df_quarantine")
+
+        con.execute(
+            """
+            CREATE OR REPLACE TABLE county_company_counts AS
+            SELECT
+                d.county_id,
+                d.county_name,
+                d.county_key,
+                d.county_fips,
+                COUNT(DISTINCT c.company) AS company_count
+            FROM county_dimension d
+            LEFT JOIN companies c
+              ON c.geo_validated = TRUE
+             AND c.county_id = d.county_id
+            GROUP BY 1, 2, 3, 4
+            ORDER BY d.county_name
+            """
+        )
+        con.execute(
+            """
+            CREATE OR REPLACE TABLE county_role_counts AS
+            SELECT
+                d.county_id,
+                d.county_name,
+                d.county_key,
+                d.county_fips,
+                LOWER(COALESCE(c.ev_supply_chain_role, '')) AS role_key,
+                COALESCE(c.ev_supply_chain_role, 'Unknown') AS role_name,
+                COUNT(*) AS company_count
+            FROM county_dimension d
+            LEFT JOIN companies c
+              ON c.geo_validated = TRUE
+             AND c.county_id = d.county_id
+            GROUP BY 1, 2, 3, 4, 5, 6
+            ORDER BY d.county_name, role_name
+            """
+        )
+        con.execute(
+            """
+            CREATE OR REPLACE TABLE county_category_counts AS
+            SELECT
+                d.county_id,
+                d.county_name,
+                d.county_key,
+                d.county_fips,
+                LOWER(COALESCE(c.category, '')) AS category_key,
+                COALESCE(c.category, 'Unknown') AS category_name,
+                COUNT(*) AS company_count
+            FROM county_dimension d
+            LEFT JOIN companies c
+              ON c.geo_validated = TRUE
+             AND c.county_id = d.county_id
+            GROUP BY 1, 2, 3, 4, 5, 6
+            ORDER BY d.county_name, category_name
+            """
+        )
 
 
 def write_faiss(embeddings: np.ndarray, faiss_path: Path) -> None:
@@ -583,11 +812,51 @@ def write_vector_metadata(
         "embedding_backend": embedding_backend,
         "embedding_model": embedding_model,
         "dimension": int(vector_dim),
-        "format": "chunked-v2",
+        "format": "chunked-v3",
         "records": chunk_records,
     }
     metadata_path.parent.mkdir(parents=True, exist_ok=True)
     metadata_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def write_audit_artifacts(
+    *,
+    join_audit_df: pd.DataFrame,
+    validation_df: pd.DataFrame,
+    audit_summary: Dict[str, object],
+    join_audit_path: Path = DEFAULT_JOIN_AUDIT_PATH,
+    join_audit_json_path: Path = DEFAULT_JOIN_AUDIT_JSON_PATH,
+    geo_validation_path: Path = DEFAULT_GEO_VALIDATION_PATH,
+) -> None:
+    join_audit_path.parent.mkdir(parents=True, exist_ok=True)
+    join_audit_df.to_csv(join_audit_path, index=False)
+    validation_df.to_csv(geo_validation_path, index=False)
+    join_audit_json_path.write_text(json.dumps(audit_summary, indent=2, default=str), encoding="utf-8")
+
+
+def write_ingestion_metadata(
+    *,
+    metadata_path: Path,
+    summary: Dict[str, object],
+    excel_path: Path,
+    geojson_path: Path,
+    coordinate_workbook: Optional[Path],
+    embedding_backend: Optional[str],
+    embedding_model: Optional[str],
+) -> None:
+    payload = {
+        **summary,
+        "excel_path": str(excel_path),
+        "geojson_path": str(geojson_path),
+        "coordinate_workbook": str(coordinate_workbook) if coordinate_workbook else None,
+        "excel_file_hash": file_sha256(excel_path),
+        "geojson_file_hash": file_sha256(geojson_path),
+        "coordinate_workbook_hash": file_sha256(coordinate_workbook) if coordinate_workbook else None,
+        "embedding_backend": embedding_backend,
+        "embedding_model": embedding_model,
+    }
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
 
 
 def resolve_input_path(primary: Path, fallback_name: str) -> Path:
@@ -603,6 +872,54 @@ def resolve_input_path(primary: Path, fallback_name: str) -> Path:
     raise FileNotFoundError(f"Missing input file: {primary} (and fallback {fallback})")
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _gate_thresholds() -> Dict[str, float]:
+    return {
+        "join_match_rate_min": float(os.getenv("JOIN_MATCH_RATE_MIN", "0.99")),
+        "duplicate_key_rate_max": float(os.getenv("DUPLICATE_KEY_RATE_MAX", "0.005")),
+        "outside_ga_rate_max": float(os.getenv("OUTSIDE_GA_RATE_MAX", "0.01")),
+        "unassignable_rate_max": float(os.getenv("UNASSIGNABLE_RATE_MAX", "0.005")),
+        "mismatch_rate_max": float(os.getenv("MISMATCH_RATE_MAX", "0.05")),
+    }
+
+
+def _check_ingestion_gate(summary: Dict[str, object], thresholds: Dict[str, float]) -> None:
+    violations: List[str] = []
+
+    if float(summary["join_match_rate"]) < thresholds["join_match_rate_min"]:
+        violations.append(
+            f"join_match_rate={summary['join_match_rate']:.4f} below threshold {thresholds['join_match_rate_min']:.4f}"
+        )
+    if float(summary["duplicate_key_rate"]) > thresholds["duplicate_key_rate_max"]:
+        violations.append(
+            f"duplicate_key_rate={summary['duplicate_key_rate']:.4f} above threshold {thresholds['duplicate_key_rate_max']:.4f}"
+        )
+    if float(summary["outside_ga_rate"]) > thresholds["outside_ga_rate_max"]:
+        violations.append(
+            f"outside_ga_rate={summary['outside_ga_rate']:.4f} above threshold {thresholds['outside_ga_rate_max']:.4f}"
+        )
+    if float(summary["unassignable_rate"]) > thresholds["unassignable_rate_max"]:
+        violations.append(
+            f"unassignable_rate={summary['unassignable_rate']:.4f} above threshold {thresholds['unassignable_rate_max']:.4f}"
+        )
+
+    county_field_trusted = bool(summary["COUNTY_FIELD_TRUSTED"])
+    mismatch_rate = float(summary["mismatch_rate"])
+    if county_field_trusted and mismatch_rate > thresholds["mismatch_rate_max"]:
+        violations.append(
+            f"mismatch_rate={mismatch_rate:.4f} above threshold {thresholds['mismatch_rate_max']:.4f}"
+        )
+
+    if violations:
+        raise IngestionGateError("Geo ingestion gate failed: " + "; ".join(violations))
+
+
 def run_ingestion(
     excel_path: Path = DEFAULT_EXCEL_PATH,
     geojson_path: Path = DEFAULT_GEOJSON_PATH,
@@ -616,6 +933,8 @@ def run_ingestion(
     geojson_path = resolve_input_path(geojson_path, "Counties_Georgia.geojson")
     coordinate_workbook = discover_coordinate_workbook(explicit_path=coordinate_excel_path)
     coordinate_df, coordinate_label = load_coordinate_enrichment(coordinate_workbook)
+    county_field_trusted = _env_bool("COUNTY_FIELD_TRUSTED", False)
+    thresholds = _gate_thresholds()
 
     xls = pd.ExcelFile(excel_path)
     sheet_name = "Data" if "Data" in xls.sheet_names else xls.sheet_names[0]
@@ -631,15 +950,45 @@ def run_ingestion(
         )
         df["employment"] = pd.to_numeric(df["employment"], errors="coerce")
 
-    county_centroids = load_county_centroids(geojson_path)
-    df = attach_coordinates(df, county_centroids, coordinate_df=coordinate_df)
+    county_index = load_county_polygons(geojson_path)
+    attached_df, join_audit_df, summary = attach_coordinates(
+        df=df,
+        county_index=county_index,
+        coordinate_df=coordinate_df,
+        county_field_trusted=county_field_trusted,
+    )
+    summary["thresholds"] = thresholds
+    summary["coordinate_workbook_label"] = coordinate_label
+    summary["coordinate_workbook_found"] = coordinate_workbook is not None
 
-    chunk_records = build_chunk_records(df)
+    write_audit_artifacts(
+        join_audit_df=join_audit_df,
+        validation_df=attached_df,
+        audit_summary=summary,
+    )
+    write_ingestion_metadata(
+        metadata_path=DEFAULT_INGESTION_METADATA_PATH,
+        summary=summary,
+        excel_path=excel_path,
+        geojson_path=geojson_path,
+        coordinate_workbook=coordinate_workbook,
+        embedding_backend=None,
+        embedding_model=None,
+    )
+
+    _check_ingestion_gate(summary, thresholds)
+
+    quarantine_mask = attached_df["outside_georgia_polygon"] | attached_df["unassignable_county"]
+    quarantine_df = attached_df[quarantine_mask].copy().reset_index(drop=True)
+    companies_df = attached_df[~quarantine_mask].copy().reset_index(drop=True)
+
+    chunk_records = build_chunk_records(companies_df)
     docs = [record["chunk_text"] for record in chunk_records]
     embeddings, backend_name, backend_model = create_embeddings(docs, model_name=model_name)
 
-    write_duckdb(df, db_path)
+    write_duckdb(companies_df, db_path)
     write_company_chunks_duckdb(chunk_records, db_path)
+    write_county_tables(db_path, county_index=county_index, quarantine_df=quarantine_df)
     write_faiss(embeddings, faiss_path)
     write_vector_metadata(
         chunk_records=chunk_records,
@@ -648,10 +997,28 @@ def run_ingestion(
         embedding_backend=backend_name,
         embedding_model=backend_model,
     )
+    write_ingestion_metadata(
+        metadata_path=DEFAULT_INGESTION_METADATA_PATH,
+        summary=summary,
+        excel_path=excel_path,
+        geojson_path=geojson_path,
+        coordinate_workbook=coordinate_workbook,
+        embedding_backend=backend_name,
+        embedding_model=backend_model,
+    )
 
-    print(f"[ingestion] Rows ingested: {len(df)}")
+    print(f"[ingestion] Rows ingested: {len(companies_df)}")
+    print(f"[ingestion] Rows quarantined: {len(quarantine_df)}")
     print(f"[ingestion] Chunks indexed: {len(chunk_records)}")
-    print(f"[ingestion] Coordinate workbook: {coordinate_label or 'not found; using existing/county fallback'}")
+    print(f"[ingestion] Coordinate workbook: {coordinate_label or 'not found'}")
+    print(f"[ingestion] COUNTY_FIELD_TRUSTED={county_field_trusted}")
+    print(f"[ingestion] County polygon repairs: {county_index.repair_count}")
+    print(f"[ingestion] County geometry hash: {county_index.geometry_hash}")
+    print(f"[ingestion] Join match rate: {summary['join_match_rate']:.4f}")
+    print(f"[ingestion] Duplicate key rate: {summary['duplicate_key_rate']:.4f}")
+    print(f"[ingestion] Outside GA rate: {summary['outside_ga_rate']:.4f}")
+    print(f"[ingestion] Unassignable rate: {summary['unassignable_rate']:.4f}")
+    print(f"[ingestion] Mismatch rate: {summary['mismatch_rate']:.4f}")
     print(f"[ingestion] DuckDB written: {db_path}")
     print(f"[ingestion] FAISS written: {faiss_path}")
     print(f"[ingestion] Metadata written: {metadata_path}")

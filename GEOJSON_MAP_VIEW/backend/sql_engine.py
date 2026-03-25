@@ -20,13 +20,33 @@ class SQLEngine:
         with duckdb.connect(str(self.db_path), read_only=True) as con:
             return con.execute(sql, params or []).fetchdf()
 
+    @staticmethod
+    def _company_select_clause() -> str:
+        return """
+            company,
+            category,
+            industry_group,
+            location,
+            city,
+            county,
+            computed_county,
+            county_key,
+            county_id,
+            county_fips,
+            ev_supply_chain_role,
+            primary_oems,
+            employment,
+            product_service,
+            latitude,
+            longitude,
+            coordinate_source,
+            geo_validated
+        """
+
     def get_companies_by_oem(self, oem_name: str) -> pd.DataFrame:
         pattern = f"%{oem_name.lower()}%"
-        sql = """
-            SELECT
-                company, category, industry_group, location, city, county,
-                ev_supply_chain_role, primary_oems, employment, product_service,
-                latitude, longitude, coordinate_source
+        sql = f"""
+            SELECT {self._company_select_clause()}
             FROM companies
             WHERE LOWER(COALESCE(primary_oems, '')) LIKE ?
             ORDER BY employment DESC NULLS LAST, company
@@ -46,9 +66,7 @@ class SQLEngine:
         column = metric_map[metric_key]
         sql = f"""
             SELECT
-                company, category, industry_group, location, city, county,
-                ev_supply_chain_role, primary_oems, employment, product_service,
-                latitude, longitude, coordinate_source,
+                {self._company_select_clause()},
                 {column} AS metric_value
             FROM companies
             WHERE {column} IS NOT NULL
@@ -59,11 +77,8 @@ class SQLEngine:
 
     def get_companies_by_industry(self, industry_group: str) -> pd.DataFrame:
         pattern = f"%{industry_group.lower()}%"
-        sql = """
-            SELECT
-                company, category, industry_group, location, city, county,
-                ev_supply_chain_role, primary_oems, employment, product_service,
-                latitude, longitude, coordinate_source
+        sql = f"""
+            SELECT {self._company_select_clause()}
             FROM companies
             WHERE LOWER(COALESCE(industry_group, '')) LIKE ?
             ORDER BY employment DESC NULLS LAST, company
@@ -108,10 +123,7 @@ class SQLEngine:
 
         where_sql = " AND ".join(clauses) if clauses else "1=1"
         sql = f"""
-            SELECT
-                company, category, industry_group, location, city, county,
-                ev_supply_chain_role, primary_oems, employment, product_service,
-                latitude, longitude, coordinate_source
+            SELECT {self._company_select_clause()}
             FROM companies
             WHERE {where_sql}
             ORDER BY employment DESC NULLS LAST, company

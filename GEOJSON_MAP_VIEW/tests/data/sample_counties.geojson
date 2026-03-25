@@ -1,0 +1,49 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "STATEFP10": "13",
+        "COUNTYFP10": "001",
+        "GEOID10": "13001",
+        "NAME10": "Alpha",
+        "NAMELSAD10": "Alpha County"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [-84.0, 32.0],
+            [-83.0, 32.0],
+            [-83.0, 33.0],
+            [-84.0, 33.0],
+            [-84.0, 32.0]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "STATEFP10": "13",
+        "COUNTYFP10": "003",
+        "GEOID10": "13003",
+        "NAME10": "Beta",
+        "NAMELSAD10": "Beta County"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [-83.0, 32.0],
+            [-82.0, 32.0],
+            [-82.0, 33.0],
+            [-83.0, 33.0],
+            [-83.0, 32.0]
+          ]
+        ]
+      }
+    }
+  ]
+}

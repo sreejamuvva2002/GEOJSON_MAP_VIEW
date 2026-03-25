@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -10,6 +9,8 @@ from typing import List, Set, Tuple
 import faiss
 import numpy as np
 import pandas as pd
+
+from backend.ingestion import _hash_embed_one
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_FAISS_PATH = PROJECT_ROOT / "data" / "gnem_faiss.index"
@@ -33,22 +34,6 @@ STOPWORDS = {
     "company",
     "km",
 }
-
-
-def _hash_embed_one(text: str, dim: int) -> np.ndarray:
-    vec = np.zeros(dim, dtype=np.float32)
-    tokens = re.findall(r"[a-z0-9]+", text.lower())
-
-    for token in tokens:
-        token_hash = int(hashlib.md5(token.encode("utf-8")).hexdigest(), 16)
-        idx = token_hash % dim
-        sign = 1.0 if ((token_hash >> 1) & 1) else -1.0
-        vec[idx] += sign
-
-    norm = np.linalg.norm(vec)
-    if norm > 0:
-        vec = vec / norm
-    return vec.astype(np.float32)
 
 
 def _tokenize(text: str) -> Set[str]:
@@ -78,21 +63,38 @@ class VectorEngine:
     def _load_metadata(self) -> Tuple[List[dict], str, str]:
         payload = json.loads(self.metadata_path.read_text(encoding="utf-8"))
         records = payload.get("records", [])
-        embedding_backend = payload.get("embedding_backend", "hash-fallback")
-        embedding_model = payload.get("embedding_model", "hashed-token")
+        embedding_backend = str(payload.get("embedding_backend") or "").strip().lower()
+        embedding_model = str(payload.get("embedding_model") or "").strip()
+        if not embedding_backend or not embedding_model:
+            raise RuntimeError("Vector metadata is missing embedding backend/model information.")
         return records, embedding_backend, embedding_model
 
     def _init_embedder(self) -> Tuple[str, object]:
-        if self.embedding_backend == "sentence-transformers":
-            try:
-                from sentence_transformers import SentenceTransformer
+        runtime_backend = os.getenv("EMBEDDING_BACKEND")
+        if runtime_backend and runtime_backend.strip().lower() not in {
+            self.embedding_backend,
+            "sentence" if self.embedding_backend == "sentence-transformers" else self.embedding_backend,
+            "sbert" if self.embedding_backend == "sentence-transformers" else self.embedding_backend,
+        }:
+            raise RuntimeError(
+                "Embedding backend mismatch between runtime configuration and vector metadata. "
+                f"Metadata backend={self.embedding_backend}, runtime backend={runtime_backend!r}."
+            )
 
-                local_only = os.getenv("EMBEDDING_LOCAL_ONLY", "true").strip().lower() == "true"
-                model = SentenceTransformer(self.embedding_model, local_files_only=local_only)
-                return "sentence-transformers", model
-            except Exception:
-                return "hash-fallback", None
-        return "hash-fallback", None
+        if self.embedding_backend == "hash":
+            return "hash", None
+
+        if self.embedding_backend == "sentence-transformers":
+            from sentence_transformers import SentenceTransformer
+
+            local_only = os.getenv("EMBEDDING_LOCAL_ONLY", "true").strip().lower() == "true"
+            model = SentenceTransformer(self.embedding_model, local_files_only=local_only)
+            return "sentence-transformers", model
+
+        raise RuntimeError(
+            f"Unsupported embedding backend in metadata: {self.embedding_backend}. "
+            "Re-run ingestion with a supported deterministic backend."
+        )
 
     def _embed_query(self, query: str) -> np.ndarray:
         if self.embed_mode == "sentence-transformers" and self.model is not None:
@@ -103,8 +105,11 @@ class VectorEngine:
             ).astype(np.float32)
             return vec
 
-        vec = _hash_embed_one(query, dim=self.dimension)
-        return vec.reshape(1, -1).astype(np.float32)
+        if self.embed_mode == "hash":
+            vec = _hash_embed_one(query, dim=self.dimension)
+            return vec.reshape(1, -1).astype(np.float32)
+
+        raise RuntimeError(f"Unsupported query embedding mode: {self.embed_mode}")
 
     def semantic_company_search(self, query: str, top_k: int = 10, per_company_limit: int = 4) -> pd.DataFrame:
         if not self.records:
@@ -142,11 +147,7 @@ class VectorEngine:
 
         df = df.sort_values(["hybrid_score", "semantic_score"], ascending=[False, False]).reset_index(drop=True)
         if per_company_limit > 0 and "company" in df.columns:
-            df = (
-                df.groupby("company", group_keys=False)
-                .head(int(per_company_limit))
-                .reset_index(drop=True)
-            )
+            df = df.groupby("company", group_keys=False).head(int(per_company_limit)).reset_index(drop=True)
 
         return df.head(int(top_k)).reset_index(drop=True)
 

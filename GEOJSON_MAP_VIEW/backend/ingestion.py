@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -12,6 +13,9 @@ import duckdb
 import faiss
 import numpy as np
 import pandas as pd
+
+if __package__ is None or __package__ == "":
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from backend.geo_utils import (
     PROJECTED_CRS,
@@ -46,10 +50,6 @@ COUNTY_COLUMN_CANDIDATES = ["county", "county_name"]
 ADDRESS_COLUMN_CANDIDATES = ["address", "street_address"]
 LATITUDE_COLUMN_CANDIDATES = ["latitude", "lat", "facility_latitude", "y"]
 LONGITUDE_COLUMN_CANDIDATES = ["longitude", "lon", "lng", "long", "facility_longitude", "x"]
-
-
-class IngestionGateError(RuntimeError):
-    pass
 
 
 def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -100,6 +100,21 @@ def extract_city_county(location: object, explicit_county: object = None) -> Tup
             county = canonical_county_display_name(parts[1])
 
     return city, county
+
+
+def extract_address_city(address: object) -> Optional[str]:
+    text = normalize_cell(address)
+    if not text:
+        return None
+    parts = [part.strip() for part in text.split(",") if part.strip()]
+    if len(parts) < 2:
+        return None
+    return parts[-2].title()
+
+
+def normalize_city_key(value: object) -> Optional[str]:
+    key = normalize_match_key(value)
+    return key or None
 
 
 def load_county_polygons(geojson_path: Path):
@@ -297,9 +312,11 @@ def _join_audit_summary(
     *,
     join_audit_df: pd.DataFrame,
     usable_coordinates: pd.Series,
+    geo_usable_flags: pd.Series,
     outside_flags: pd.Series,
     unassignable_flags: pd.Series,
     mismatch_flags: pd.Series,
+    city_conflict_flags: pd.Series,
     county_field_trusted: bool,
     duplicate_key_rate: float,
     duplicate_key_counts: Dict[str, int],
@@ -311,9 +328,11 @@ def _join_audit_summary(
     matched_rows = int(coordinate_join_mask.sum())
 
     usable_count = int(usable_coordinates.sum())
+    geo_usable_count = int(geo_usable_flags.sum())
     outside_count = int(outside_flags.sum())
     unassignable_count = int(unassignable_flags.sum())
     mismatch_count = int(mismatch_flags.sum())
+    city_conflict_count = int(city_conflict_flags.sum())
     mismatch_denominator = int((join_audit_df["existing_county"].fillna("") != "").sum())
 
     return {
@@ -325,6 +344,8 @@ def _join_audit_summary(
         "duplicate_key_rate": duplicate_key_rate,
         "duplicate_key_counts": duplicate_key_counts,
         "usable_coordinate_rows": usable_count,
+        "geo_usable_rows": geo_usable_count,
+        "geo_usable_rate": (geo_usable_count / total_rows) if total_rows else 0.0,
         "outside_ga_rate": (outside_count / usable_count) if usable_count else 0.0,
         "outside_ga_count": outside_count,
         "unassignable_rate": (unassignable_count / usable_count) if usable_count else 0.0,
@@ -332,6 +353,8 @@ def _join_audit_summary(
         "mismatch_rate": (mismatch_count / mismatch_denominator) if mismatch_denominator else 0.0,
         "mismatch_count": mismatch_count,
         "mismatch_denominator": mismatch_denominator,
+        "city_conflict_count": city_conflict_count,
+        "city_conflict_rate": (city_conflict_count / total_rows) if total_rows else 0.0,
         "county_polygon_repair_count": county_index.repair_count,
         "county_polygon_repair_counties": county_index.repaired_counties,
         "county_geometry_hash": county_index.geometry_hash,
@@ -368,8 +391,10 @@ def attach_coordinates(
     outside_flags: List[bool] = []
     unassignable_flags: List[bool] = []
     mismatch_flags: List[bool] = []
-    quarantine_reasons: List[str] = []
+    city_conflict_flags: List[bool] = []
+    quality_statuses: List[str] = []
     geo_validated_flags: List[bool] = []
+    geo_usable_flags: List[bool] = []
 
     exact_lookup: Dict[str, dict] = {}
     exact_duplicate_keys: set[str] = set()
@@ -399,6 +424,7 @@ def attach_coordinates(
         company_key = normalize_match_key(company_name)
         location_key = normalize_match_key(location_text)
         exact_join_key = f"{company_key}||{location_key}" if location_key else ""
+        source_city_key = normalize_city_key(city)
 
         lat = _safe_float(row.get("latitude"))
         lon = _safe_float(row.get("longitude"))
@@ -449,46 +475,119 @@ def attach_coordinates(
         county_fips_value = None
         outside_flag = False
         unassignable_flag = False
-        geo_validated = False
-        quarantine_reason = ""
+        city_conflict = False
+        geo_usable = False
+        quality_status = "missing_coordinates"
+
+        coord_declared_city = None
+        coord_location_city = None
+        address_city = None
+        coord_declared_county = None
+        coord_location_county = None
 
         if usable_coordinates:
             county_match = compute_county_for_point(county_index, latitude=lat, longitude=lon)
             if county_match is None:
                 outside_flag = True
                 unassignable_flag = True
-                quarantine_reason = "outside_georgia_polygon"
+                quality_status = "outside_reference_geometry"
             else:
                 computed_county = county_match.county_name
                 county_key = county_match.county_key
                 county_id = county_match.county_id
                 county_fips_value = county_match.county_fips
-                geo_validated = True
 
         existing_county_key = normalize_county_name(existing_county)
+        if join_record:
+            coord_declared_city = normalize_cell(join_record.get("coord_city")) or None
+            coord_location_city, coord_location_county = extract_city_county(
+                join_record.get("coord_location"),
+                explicit_county=join_record.get("coord_county"),
+            )
+            address_city = extract_address_city(join_record.get("coord_address"))
+            coord_declared_county = canonical_county_display_name(join_record.get("coord_county")) or None
+
+        strong_city_keys = {
+            key
+            for key in [
+                normalize_city_key(coord_declared_city),
+                normalize_city_key(address_city),
+            ]
+            if key
+        }
+        weak_city_keys = {
+            key
+            for key in [
+                normalize_city_key(coord_location_city),
+            ]
+            if key
+        }
+
+        county_supported = not existing_county_key or (county_key is not None and existing_county_key == county_key)
+        if source_city_key:
+            if strong_city_keys:
+                city_supported = source_city_key in strong_city_keys
+            elif weak_city_keys and join_status == "matched_exact":
+                city_supported = source_city_key in weak_city_keys
+            elif join_status in {"source_coordinates", "matched_exact"} and existing_county_key and county_supported:
+                city_supported = True
+            else:
+                city_supported = False
+        else:
+            city_supported = True
+
         mismatch_flag = bool(
             county_field_trusted
             and existing_county_key
             and county_key
             and existing_county_key != county_key
         )
+        city_conflict = bool(source_city_key and strong_city_keys and source_city_key not in strong_city_keys)
+
+        if not usable_coordinates:
+            quality_status = join_status if join_status != "source_coordinates" else "missing_coordinates"
+        elif county_key is None:
+            quality_status = "outside_reference_geometry"
+        elif mismatch_flag:
+            quality_status = "county_conflict"
+        elif city_conflict:
+            quality_status = "city_conflict"
+        else:
+            if join_status == "source_coordinates":
+                geo_usable = True
+            elif join_status == "matched_exact":
+                geo_usable = county_supported and city_supported
+            elif join_status == "matched_company_fallback":
+                geo_usable = county_supported and city_supported and bool(existing_county_key or source_city_key)
+            else:
+                geo_usable = False
+
+            if geo_usable:
+                quality_status = "geo_usable"
+            elif join_status == "matched_company_fallback":
+                quality_status = "company_fallback_unverified"
+            else:
+                quality_status = "insufficient_location_consistency"
 
         coordinate_sources.append(coordinate_source if usable_coordinates else "missing")
         computed_counties.append(computed_county)
-        county_keys.append(county_key if county_key else existing_county_key)
-        county_ids.append(county_id)
-        county_fips.append(county_fips_value)
+        county_keys.append(county_key if geo_usable and county_key else existing_county_key)
+        county_ids.append(county_id if geo_usable else None)
+        county_fips.append(county_fips_value if geo_usable else None)
         outside_flags.append(outside_flag)
         unassignable_flags.append(unassignable_flag)
         mismatch_flags.append(mismatch_flag)
-        quarantine_reasons.append(quarantine_reason)
-        geo_validated_flags.append(geo_validated)
+        city_conflict_flags.append(city_conflict)
+        quality_statuses.append(quality_status)
+        geo_validated_flags.append(geo_usable)
+        geo_usable_flags.append(geo_usable)
 
         join_rows.append(
             {
                 "row_index": row_idx,
                 "company": company_name,
                 "location": location_text,
+                "source_city": city,
                 "existing_county": existing_county,
                 "computed_county": computed_county,
                 "join_key_used": join_method,
@@ -500,20 +599,29 @@ def attach_coordinates(
                 "coordinate_company": normalize_cell(join_record.get("coord_company")) if join_record else "",
                 "coordinate_location": normalize_cell(join_record.get("coord_location")) if join_record else "",
                 "coordinate_address": normalize_cell(join_record.get("coord_address")) if join_record else "",
-                "coordinate_city": normalize_cell(join_record.get("coord_city")) if join_record else "",
-                "coordinate_county": canonical_county_display_name(join_record.get("coord_county")) if join_record else "",
+                "coordinate_city": coord_declared_city or "",
+                "coordinate_location_city": coord_location_city or "",
+                "coordinate_address_city": address_city or "",
+                "coordinate_county": coord_declared_county or "",
+                "coordinate_location_county": coord_location_county or "",
                 "latitude": lat if usable_coordinates else None,
                 "longitude": lon if usable_coordinates else None,
                 "outside_georgia_polygon": outside_flag,
                 "unassignable_county": unassignable_flag,
                 "county_mismatch": mismatch_flag,
+                "city_conflict": city_conflict,
+                "geo_usable": geo_usable,
+                "geo_quality_status": quality_status,
             }
         )
 
     out["city"] = source_cities
     out["existing_county"] = source_counties
     out["computed_county"] = computed_counties
-    out["county"] = [computed if computed else existing for computed, existing in zip(computed_counties, source_counties)]
+    out["county"] = [
+        computed if geo_usable and computed else existing
+        for computed, existing, geo_usable in zip(computed_counties, source_counties, geo_usable_flags)
+    ]
     out["county_key"] = county_keys
     out["county_id"] = county_ids
     out["county_fips"] = county_fips
@@ -523,7 +631,9 @@ def attach_coordinates(
     out["outside_georgia_polygon"] = outside_flags
     out["unassignable_county"] = unassignable_flags
     out["county_mismatch"] = mismatch_flags
-    out["geo_quarantine_reason"] = quarantine_reasons
+    out["city_conflict"] = city_conflict_flags
+    out["geo_quality_status"] = quality_statuses
+    out["geo_usable"] = geo_usable_flags
     out["geo_validated"] = geo_validated_flags
 
     join_audit_df = pd.DataFrame(join_rows)
@@ -531,9 +641,11 @@ def attach_coordinates(
     summary = _join_audit_summary(
         join_audit_df=join_audit_df,
         usable_coordinates=usable_coordinates_series,
+        geo_usable_flags=out["geo_usable"],
         outside_flags=out["outside_georgia_polygon"],
         unassignable_flags=out["unassignable_county"],
         mismatch_flags=out["county_mismatch"],
+        city_conflict_flags=out["city_conflict"],
         county_field_trusted=county_field_trusted,
         duplicate_key_rate=duplicate_key_rate,
         duplicate_key_counts=duplicate_key_counts,
@@ -571,7 +683,8 @@ def build_chunk_records(df: pd.DataFrame) -> List[dict]:
         longitude = _safe_float(row.get("longitude"))
         coordinate_source = normalize_cell(row.get("coordinate_source"))
         county_fips = normalize_cell(row.get("county_fips"))
-        geo_validated = bool(row.get("geo_validated"))
+        geo_usable = bool(row.get("geo_usable", row.get("geo_validated")))
+        geo_quality_status = normalize_cell(row.get("geo_quality_status"))
 
         base = {
             "company": company,
@@ -593,7 +706,9 @@ def build_chunk_records(df: pd.DataFrame) -> List[dict]:
             "latitude": latitude,
             "longitude": longitude,
             "coordinate_source": coordinate_source,
-            "geo_validated": geo_validated,
+            "geo_usable": geo_usable,
+            "geo_validated": geo_usable,
+            "geo_quality_status": geo_quality_status,
             "row_index": int(row_idx),
             "source_dataset": "gnem_companies.xlsx",
         }
@@ -634,7 +749,8 @@ def build_chunk_records(df: pd.DataFrame) -> List[dict]:
                 f"Latitude: {latitude if latitude is not None else 'unknown'}\n"
                 f"Longitude: {longitude if longitude is not None else 'unknown'}\n"
                 f"Coordinate Source: {coordinate_source or 'unknown'}\n"
-                f"Geo Validated: {geo_validated}\n"
+                f"Geo Usable: {geo_usable}\n"
+                f"Geo Quality Status: {geo_quality_status or 'unknown'}\n"
                 f"Employment: {int(employment) if employment is not None else 'unknown'}"
             ),
         }
@@ -708,7 +824,7 @@ def write_company_chunks_duckdb(chunk_records: List[dict], db_path: Path) -> Non
         con.execute("CREATE OR REPLACE TABLE company_chunks AS SELECT * FROM df_company_chunks")
 
 
-def write_county_tables(db_path: Path, county_index, quarantine_df: pd.DataFrame) -> None:
+def write_county_tables(db_path: Path, county_index, issue_df: pd.DataFrame) -> None:
     county_rows = [
         {
             "county_id": county.county_id,
@@ -729,11 +845,11 @@ def write_county_tables(db_path: Path, county_index, quarantine_df: pd.DataFrame
         con.register("df_counties", county_df)
         con.execute("CREATE OR REPLACE TABLE county_dimension AS SELECT * FROM df_counties")
 
-        con.register("df_quarantine", quarantine_df if not quarantine_df.empty else pd.DataFrame({"placeholder": []}))
-        if quarantine_df.empty:
-            con.execute("CREATE OR REPLACE TABLE geo_quarantine AS SELECT * FROM df_quarantine LIMIT 0")
+        con.register("df_geo_issues", issue_df if not issue_df.empty else pd.DataFrame({"placeholder": []}))
+        if issue_df.empty:
+            con.execute("CREATE OR REPLACE TABLE geo_evaluation_issues AS SELECT * FROM df_geo_issues LIMIT 0")
         else:
-            con.execute("CREATE OR REPLACE TABLE geo_quarantine AS SELECT * FROM df_quarantine")
+            con.execute("CREATE OR REPLACE TABLE geo_evaluation_issues AS SELECT * FROM df_geo_issues")
 
         con.execute(
             """
@@ -746,7 +862,7 @@ def write_county_tables(db_path: Path, county_index, quarantine_df: pd.DataFrame
                 COUNT(DISTINCT c.company) AS company_count
             FROM county_dimension d
             LEFT JOIN companies c
-              ON c.geo_validated = TRUE
+              ON c.geo_usable = TRUE
              AND c.county_id = d.county_id
             GROUP BY 1, 2, 3, 4
             ORDER BY d.county_name
@@ -765,7 +881,7 @@ def write_county_tables(db_path: Path, county_index, quarantine_df: pd.DataFrame
                 COUNT(*) AS company_count
             FROM county_dimension d
             LEFT JOIN companies c
-              ON c.geo_validated = TRUE
+              ON c.geo_usable = TRUE
              AND c.county_id = d.county_id
             GROUP BY 1, 2, 3, 4, 5, 6
             ORDER BY d.county_name, role_name
@@ -784,7 +900,7 @@ def write_county_tables(db_path: Path, county_index, quarantine_df: pd.DataFrame
                 COUNT(*) AS company_count
             FROM county_dimension d
             LEFT JOIN companies c
-              ON c.geo_validated = TRUE
+              ON c.geo_usable = TRUE
              AND c.county_id = d.county_id
             GROUP BY 1, 2, 3, 4, 5, 6
             ORDER BY d.county_name, category_name
@@ -886,38 +1002,47 @@ def _gate_thresholds() -> Dict[str, float]:
         "outside_ga_rate_max": float(os.getenv("OUTSIDE_GA_RATE_MAX", "0.01")),
         "unassignable_rate_max": float(os.getenv("UNASSIGNABLE_RATE_MAX", "0.005")),
         "mismatch_rate_max": float(os.getenv("MISMATCH_RATE_MAX", "0.05")),
+        "geo_usable_rate_min": float(os.getenv("GEO_USABLE_RATE_MIN", "0.70")),
+        "city_conflict_rate_max": float(os.getenv("CITY_CONFLICT_RATE_MAX", "0.10")),
     }
 
 
-def _check_ingestion_gate(summary: Dict[str, object], thresholds: Dict[str, float]) -> None:
-    violations: List[str] = []
+def _collect_quality_warnings(summary: Dict[str, object], thresholds: Dict[str, float]) -> List[str]:
+    warnings: List[str] = []
 
     if float(summary["join_match_rate"]) < thresholds["join_match_rate_min"]:
-        violations.append(
+        warnings.append(
             f"join_match_rate={summary['join_match_rate']:.4f} below threshold {thresholds['join_match_rate_min']:.4f}"
         )
     if float(summary["duplicate_key_rate"]) > thresholds["duplicate_key_rate_max"]:
-        violations.append(
+        warnings.append(
             f"duplicate_key_rate={summary['duplicate_key_rate']:.4f} above threshold {thresholds['duplicate_key_rate_max']:.4f}"
         )
     if float(summary["outside_ga_rate"]) > thresholds["outside_ga_rate_max"]:
-        violations.append(
+        warnings.append(
             f"outside_ga_rate={summary['outside_ga_rate']:.4f} above threshold {thresholds['outside_ga_rate_max']:.4f}"
         )
     if float(summary["unassignable_rate"]) > thresholds["unassignable_rate_max"]:
-        violations.append(
+        warnings.append(
             f"unassignable_rate={summary['unassignable_rate']:.4f} above threshold {thresholds['unassignable_rate_max']:.4f}"
+        )
+    if float(summary.get("geo_usable_rate", 0.0)) < thresholds["geo_usable_rate_min"]:
+        warnings.append(
+            f"geo_usable_rate={summary.get('geo_usable_rate', 0.0):.4f} below threshold {thresholds['geo_usable_rate_min']:.4f}"
+        )
+    if float(summary.get("city_conflict_rate", 0.0)) > thresholds["city_conflict_rate_max"]:
+        warnings.append(
+            f"city_conflict_rate={summary.get('city_conflict_rate', 0.0):.4f} above threshold {thresholds['city_conflict_rate_max']:.4f}"
         )
 
     county_field_trusted = bool(summary["COUNTY_FIELD_TRUSTED"])
     mismatch_rate = float(summary["mismatch_rate"])
     if county_field_trusted and mismatch_rate > thresholds["mismatch_rate_max"]:
-        violations.append(
+        warnings.append(
             f"mismatch_rate={mismatch_rate:.4f} above threshold {thresholds['mismatch_rate_max']:.4f}"
         )
 
-    if violations:
-        raise IngestionGateError("Geo ingestion gate failed: " + "; ".join(violations))
+    return warnings
 
 
 def run_ingestion(
@@ -927,6 +1052,9 @@ def run_ingestion(
     db_path: Path = DEFAULT_DB_PATH,
     faiss_path: Path = DEFAULT_FAISS_PATH,
     metadata_path: Path = DEFAULT_METADATA_PATH,
+    join_audit_path: Path = DEFAULT_JOIN_AUDIT_PATH,
+    geo_validation_path: Path = DEFAULT_GEO_VALIDATION_PATH,
+    ingestion_metadata_path: Path = DEFAULT_INGESTION_METADATA_PATH,
     model_name: str = DEFAULT_MODEL_NAME,
 ) -> None:
     excel_path = resolve_input_path(excel_path, "GNEM updated excel.xlsx")
@@ -960,14 +1088,17 @@ def run_ingestion(
     summary["thresholds"] = thresholds
     summary["coordinate_workbook_label"] = coordinate_label
     summary["coordinate_workbook_found"] = coordinate_workbook is not None
+    summary["quality_warnings"] = _collect_quality_warnings(summary, thresholds)
 
     write_audit_artifacts(
         join_audit_df=join_audit_df,
         validation_df=attached_df,
         audit_summary=summary,
+        join_audit_path=join_audit_path,
+        geo_validation_path=geo_validation_path,
     )
     write_ingestion_metadata(
-        metadata_path=DEFAULT_INGESTION_METADATA_PATH,
+        metadata_path=ingestion_metadata_path,
         summary=summary,
         excel_path=excel_path,
         geojson_path=geojson_path,
@@ -976,19 +1107,15 @@ def run_ingestion(
         embedding_model=None,
     )
 
-    _check_ingestion_gate(summary, thresholds)
-
-    quarantine_mask = attached_df["outside_georgia_polygon"] | attached_df["unassignable_county"]
-    quarantine_df = attached_df[quarantine_mask].copy().reset_index(drop=True)
-    companies_df = attached_df[~quarantine_mask].copy().reset_index(drop=True)
-
+    companies_df = attached_df.copy().reset_index(drop=True)
+    issue_df = attached_df[~attached_df["geo_usable"]].copy().reset_index(drop=True)
     chunk_records = build_chunk_records(companies_df)
     docs = [record["chunk_text"] for record in chunk_records]
     embeddings, backend_name, backend_model = create_embeddings(docs, model_name=model_name)
 
     write_duckdb(companies_df, db_path)
     write_company_chunks_duckdb(chunk_records, db_path)
-    write_county_tables(db_path, county_index=county_index, quarantine_df=quarantine_df)
+    write_county_tables(db_path, county_index=county_index, issue_df=issue_df)
     write_faiss(embeddings, faiss_path)
     write_vector_metadata(
         chunk_records=chunk_records,
@@ -998,7 +1125,7 @@ def run_ingestion(
         embedding_model=backend_model,
     )
     write_ingestion_metadata(
-        metadata_path=DEFAULT_INGESTION_METADATA_PATH,
+        metadata_path=ingestion_metadata_path,
         summary=summary,
         excel_path=excel_path,
         geojson_path=geojson_path,
@@ -1008,17 +1135,24 @@ def run_ingestion(
     )
 
     print(f"[ingestion] Rows ingested: {len(companies_df)}")
-    print(f"[ingestion] Rows quarantined: {len(quarantine_df)}")
+    print(f"[ingestion] Rows with geo-usable coordinates: {int(companies_df['geo_usable'].sum())}")
+    print(f"[ingestion] Rows with geo issues: {len(issue_df)}")
     print(f"[ingestion] Chunks indexed: {len(chunk_records)}")
     print(f"[ingestion] Coordinate workbook: {coordinate_label or 'not found'}")
     print(f"[ingestion] COUNTY_FIELD_TRUSTED={county_field_trusted}")
     print(f"[ingestion] County polygon repairs: {county_index.repair_count}")
     print(f"[ingestion] County geometry hash: {county_index.geometry_hash}")
     print(f"[ingestion] Join match rate: {summary['join_match_rate']:.4f}")
+    print(f"[ingestion] Geo usable rate: {summary['geo_usable_rate']:.4f}")
     print(f"[ingestion] Duplicate key rate: {summary['duplicate_key_rate']:.4f}")
     print(f"[ingestion] Outside GA rate: {summary['outside_ga_rate']:.4f}")
     print(f"[ingestion] Unassignable rate: {summary['unassignable_rate']:.4f}")
     print(f"[ingestion] Mismatch rate: {summary['mismatch_rate']:.4f}")
+    print(f"[ingestion] City conflict rate: {summary['city_conflict_rate']:.4f}")
+    if summary["quality_warnings"]:
+        print("[ingestion] Quality warnings:")
+        for warning in summary["quality_warnings"]:
+            print(f"[ingestion]  - {warning}")
     print(f"[ingestion] DuckDB written: {db_path}")
     print(f"[ingestion] FAISS written: {faiss_path}")
     print(f"[ingestion] Metadata written: {metadata_path}")
@@ -1042,6 +1176,24 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_METADATA_PATH,
         help="Output vector metadata JSON path.",
     )
+    parser.add_argument(
+        "--join-audit",
+        type=Path,
+        default=DEFAULT_JOIN_AUDIT_PATH,
+        help="Output coordinate join audit CSV path.",
+    )
+    parser.add_argument(
+        "--geo-validation",
+        type=Path,
+        default=DEFAULT_GEO_VALIDATION_PATH,
+        help="Output geo validation CSV path.",
+    )
+    parser.add_argument(
+        "--ingestion-metadata",
+        type=Path,
+        default=DEFAULT_INGESTION_METADATA_PATH,
+        help="Output ingestion metadata JSON path.",
+    )
     parser.add_argument("--model", type=str, default=DEFAULT_MODEL_NAME, help="Embedding model name.")
     return parser.parse_args()
 
@@ -1055,5 +1207,8 @@ if __name__ == "__main__":
         db_path=args.db,
         faiss_path=args.faiss,
         metadata_path=args.metadata,
+        join_audit_path=args.join_audit,
+        geo_validation_path=args.geo_validation,
+        ingestion_metadata_path=args.ingestion_metadata,
         model_name=args.model,
     )

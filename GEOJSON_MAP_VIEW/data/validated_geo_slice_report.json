@@ -1,0 +1,186 @@
+{
+  "validated_source_rows": 16,
+  "validated_coordinate_rows": 16,
+  "mapping_rules": {
+    "mutual_unique_city_county": 11,
+    "direct_strong_match": 5
+  },
+  "mappings": [
+    {
+      "rule": "direct_strong_match",
+      "source_row_index": 2,
+      "coord_row_index": 2,
+      "source_company": "ADVICS Manufacturing Georgia LLC",
+      "source_location": "Troup County",
+      "coord_company": "ADVICS Manufacturing Georgia LLC",
+      "coord_location": "Troup County",
+      "address": "1621 Lukken Industrial Dr W, LaGrange, GA 30240",
+      "computed_county": "troup"
+    },
+    {
+      "rule": "direct_strong_match",
+      "source_row_index": 26,
+      "coord_row_index": 25,
+      "source_company": "Constellium Automotive USA",
+      "source_location": "Cartersville, Bartow County",
+      "coord_company": "Constellium Automotive USA",
+      "coord_location": "Cartersville, Bartow County",
+      "address": "1 Constellium Way, Cartersville, GA 30120",
+      "computed_county": "bartow"
+    },
+    {
+      "rule": "direct_strong_match",
+      "source_row_index": 33,
+      "coord_row_index": 32,
+      "source_company": "Daimler Truck North America",
+      "source_location": "Covington, Newton County",
+      "coord_company": "Daimler Truck North America",
+      "coord_location": "Covington, Newton County",
+      "address": "7400 E Freeman Pkwy, Covington, GA 30014",
+      "computed_county": "newton"
+    },
+    {
+      "rule": "direct_strong_match",
+      "source_row_index": 98,
+      "coord_row_index": 97,
+      "source_company": "Kyungshin America Corp.",
+      "source_location": "Troup County",
+      "coord_company": "Kyungshin America Corp.",
+      "coord_location": "Troup County",
+      "address": "85 Kyungshin Dr, West Point, GA 31833",
+      "computed_county": "troup"
+    },
+    {
+      "rule": "direct_strong_match",
+      "source_row_index": 178,
+      "coord_row_index": 176,
+      "source_company": "Textron Specialized Vehicles",
+      "source_location": "Augusta, Richmond County",
+      "coord_company": "Textron Specialized Vehicles",
+      "coord_location": "Augusta, Richmond County",
+      "address": "1451 Marvin Griffin Rd, Augusta, GA 30906",
+      "computed_county": "richmond"
+    },
+    {
+      "rule": "mutual_unique_city_county",
+      "source_row_index": 1,
+      "coord_row_index": 163,
+      "source_company": "Adient",
+      "source_location": "Ringgold, Catoosa County",
+      "coord_company": "SKF USA Inc.",
+      "coord_location": "Carnesville, Franklin County",
+      "address": "301 David Fletcher Dr, Ringgold, GA 30736",
+      "computed_county": "catoosa"
+    },
+    {
+      "rule": "mutual_unique_city_county",
+      "source_row_index": 6,
+      "coord_row_index": 76,
+      "source_company": "Apache Mills Inc.",
+      "source_location": "Hawkinsville, Pulaski County",
+      "coord_company": "Hollingsworth & Vose Co.",
+      "coord_location": "Bainbridge, Decatur County",
+      "address": "111 Hollingsworth & Vose Rd, Hawkinsville, GA 31036",
+      "computed_county": "pulaski"
+    },
+    {
+      "rule": "mutual_unique_city_county",
+      "source_row_index": 8,
+      "coord_row_index": 172,
+      "source_company": "Archer Aviation Inc.",
+      "source_location": "Ellaville, Schley County",
+      "coord_company": "TCI Powder Coatings",
+      "coord_location": "Troup County",
+      "address": "610 Dixon Dr, Ellaville, GA 31806",
+      "computed_county": "schley"
+    },
+    {
+      "rule": "mutual_unique_city_county",
+      "source_row_index": 14,
+      "coord_row_index": 27,
+      "source_company": "AVS",
+      "source_location": "Barnesville, Lamar County",
+      "coord_company": "Continental Tire the Americas LLC",
+      "coord_location": "Lawrenceville, Gwinnett County",
+      "address": "160 Aldora St, Barnesville, GA 30204",
+      "computed_county": "lamar"
+    },
+    {
+      "rule": "mutual_unique_city_county",
+      "source_row_index": 55,
+      "coord_row_index": 144,
+      "source_company": "First American Resources",
+      "source_location": "Albany, Dougherty County",
+      "coord_company": "Pirelli Tire North America LLC",
+      "coord_location": "Carnesville, Franklin County",
+      "address": "2819 Old Dawson Rd, Albany, GA 31707",
+      "computed_county": "dougherty"
+    },
+    {
+      "rule": "mutual_unique_city_county",
+      "source_row_index": 59,
+      "coord_row_index": 0,
+      "source_company": "Freudenberg-NOK",
+      "source_location": "Warrenton, Warren County",
+      "coord_company": "ACM Georgia LLC",
+      "coord_location": "Calhoun, Gordon County",
+      "address": "975 Thomson Hwy, Warrenton, GA 30828",
+      "computed_county": "warren"
+    },
+    {
+      "rule": "mutual_unique_city_county",
+      "source_row_index": 89,
+      "coord_row_index": 142,
+      "source_company": "JAC Products Inc.",
+      "source_location": "Clarkesville, Habersham County",
+      "coord_company": "Piedmont Automotive Products Inc.",
+      "coord_location": "Hamilton, Harris County",
+      "address": "1058 Rocky Branch Rd, Clarkesville, GA 30523",
+      "computed_county": "habersham"
+    },
+    {
+      "rule": "mutual_unique_city_county",
+      "source_row_index": 122,
+      "coord_row_index": 33,
+      "source_company": "Nidec Elesys Americas Corp.",
+      "source_location": "Metter, Candler County",
+      "coord_company": "DAS Corp.",
+      "coord_location": "Gainesville, Hall County",
+      "address": "730 Fortner Rd, Metter, GA 30439",
+      "computed_county": "candler"
+    },
+    {
+      "rule": "mutual_unique_city_county",
+      "source_row_index": 146,
+      "coord_row_index": 125,
+      "source_company": "Porsche Cars North America Inc.",
+      "source_location": "Cairo, Grady County",
+      "coord_company": "Nivel Parts & Manufacturing Co. LLC",
+      "coord_location": "Savannah, Chatham County",
+      "address": "2051 2nd Ave NE, Cairo, GA 39828",
+      "computed_county": "grady"
+    },
+    {
+      "rule": "mutual_unique_city_county",
+      "source_row_index": 170,
+      "coord_row_index": 42,
+      "source_company": "Sumitomo Electric Wiring Systems",
+      "source_location": "Baxley, Appling County",
+      "coord_company": "Down 2 Earth Trailers",
+      "coord_location": "Cartersville, Bartow County",
+      "address": "1605 E Parker Street, Baxley, GA 31513",
+      "computed_county": "appling"
+    },
+    {
+      "rule": "mutual_unique_city_county",
+      "source_row_index": 176,
+      "coord_row_index": 16,
+      "source_company": "TE Connectivity",
+      "source_location": "Fort Valley, Peach County",
+      "coord_company": "Blue Bird Corp.",
+      "coord_location": "Elberton, Elbert County",
+      "address": "402 Blue Bird Blvd, Fort Valley, GA 31030",
+      "computed_county": "peach"
+    }
+  ]
+}

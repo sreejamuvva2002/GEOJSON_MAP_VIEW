@@ -87,11 +87,13 @@ class SpatialEngine:
                     latitude,
                     longitude,
                     coordinate_source,
-                    geo_validated
+                    geo_usable,
+                    geo_validated,
+                    geo_quality_status
                 FROM companies
                 WHERE latitude IS NOT NULL
                   AND longitude IS NOT NULL
-                  AND geo_validated = TRUE
+                  AND geo_usable = TRUE
                 """
             ).fetchdf()
         return df

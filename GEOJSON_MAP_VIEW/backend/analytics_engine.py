@@ -94,9 +94,12 @@ class AnalyticsEngine:
                 latitude,
                 longitude,
                 coordinate_source,
+                geo_usable,
+                geo_quality_status,
                 geo_validated
             FROM companies
             WHERE county_key = ?
+              AND geo_usable = TRUE
             ORDER BY company
             """,
             [county_key],
@@ -125,6 +128,8 @@ class AnalyticsEngine:
                 latitude,
                 longitude,
                 coordinate_source,
+                geo_usable,
+                geo_quality_status,
                 geo_validated
             FROM companies
             WHERE employment IS NOT NULL

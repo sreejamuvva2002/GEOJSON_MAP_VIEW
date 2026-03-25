@@ -40,6 +40,8 @@ class SQLEngine:
             latitude,
             longitude,
             coordinate_source,
+            geo_usable,
+            geo_quality_status,
             geo_validated
         """
 

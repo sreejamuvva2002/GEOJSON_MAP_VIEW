@@ -823,7 +823,7 @@ class HybridGeospatialRAGPipeline:
             "company": None,
             "chunk_type": "geo_no_results",
             "score": 1.0,
-            "text": f"No validated companies matched the deterministic geo query for '{question}'.",
+            "text": f"No geo-usable companies matched the deterministic geo query for '{question}'.",
             "meta": {
                 "evidence_id": evidence_id,
                 "operation": operation,
@@ -847,15 +847,15 @@ class HybridGeospatialRAGPipeline:
         county_name = canonical_county_display_name(plan.get("target_county")) if plan.get("target_county") else None
         if plan.get("requires_polygon_distance") and county_name:
             lines.append(
-                f"- Found {len(df)} validated companies within {float(plan.get('radius_miles') or 0.0):.1f} miles of {county_name} County using polygon distance in {PROJECTED_CRS}. [{retrieved_chunks[0]['evidence_id']}]"
+                f"- Found {len(df)} geo-usable companies within {float(plan.get('radius_miles') or 0.0):.1f} miles of {county_name} County using polygon distance in {PROJECTED_CRS}. [{retrieved_chunks[0]['evidence_id']}]"
             )
         elif county_name:
             lines.append(
-                f"- Found {len(df)} validated companies in {county_name} County by point-in-polygon county membership. [{retrieved_chunks[0]['evidence_id']}]"
+                f"- Found {len(df)} geo-usable companies in {county_name} County by point-in-polygon county membership. [{retrieved_chunks[0]['evidence_id']}]"
             )
         else:
             lines.append(
-                f"- Found {len(df)} validated companies for the requested point-radius search. [{retrieved_chunks[0]['evidence_id']}]"
+                f"- Found {len(df)} geo-usable companies for the requested point-radius search. [{retrieved_chunks[0]['evidence_id']}]"
             )
 
         for chunk in retrieved_chunks[:5]:

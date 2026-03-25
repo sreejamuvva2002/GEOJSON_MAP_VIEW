@@ -351,6 +351,10 @@ def render_map(records: List[Dict], selected_county: Optional[str]) -> None:
     layers = [county_layer]
     point_df = filtered_df.copy() if not filtered_df.empty else pd.DataFrame(records).copy()
     if not point_df.empty and {"latitude", "longitude"}.issubset(point_df.columns):
+        if "geo_usable" in point_df.columns:
+            geo_mask = point_df["geo_usable"].fillna(False).astype(bool)
+            if geo_mask.any():
+                point_df = point_df[geo_mask].copy()
         point_df["latitude"] = pd.to_numeric(point_df["latitude"], errors="coerce")
         point_df["longitude"] = pd.to_numeric(point_df["longitude"], errors="coerce")
         point_df = point_df.dropna(subset=["latitude", "longitude"]).copy()
@@ -382,7 +386,7 @@ def render_map(records: List[Dict], selected_county: Optional[str]) -> None:
     tooltip = {
         "html": (
             "<b>{county_name} County</b><br/>"
-            "Total validated companies: {total_count}<br/>"
+            "Total geo-usable companies: {total_count}<br/>"
             "Retrieved companies: {filtered_count}<br/>"
             "Roles: {role_summary}<br/>"
             "Categories: {category_summary}<br/><br/>"

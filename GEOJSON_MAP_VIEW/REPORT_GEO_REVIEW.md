@@ -23,6 +23,11 @@ Current state in one sentence:
 
 **The codebase partially demonstrates a geospatial RAG prototype, but it fails the geo-correctness gate because county polygons are not rendered in the UI, county reasoning is centroid-based rather than polygon-based, and the stored coordinates are not validated before indexing or mapping.**
 
+Plain-language status:
+
+**Everything is not ok yet for a professor-defensible Summit demo.**
+The prototype is promising, but the geo layer should still be treated as unsafe until the coordinate join is audited, the fail-fast thresholds are enforced, and county math is rebuilt on true polygons.
+
 ## Bottom-Line Assessment
 
 ### What is already present
@@ -71,6 +76,16 @@ Before any UI or RAG claims are trusted, the pipeline must:
    - FAISS indexing
    - geo retrieval
 
+Why this ordering matters:
+
+- Quarantine alone is not enough.
+- If the upstream join is wrong, quarantine can hide the root cause by producing a tiny “clean” subset while the real data problem remains unresolved.
+- The coordinate-join audit must therefore run first and must prove:
+  - the join key is correct
+  - the match rate is acceptable
+  - duplicate keys are understood
+  - sample company/address/coordinate pairings make sense on inspection
+
 ### Current Gate Status: FAIL
 
 Observed from the current built artifacts:
@@ -88,6 +103,14 @@ Observed from polygon validation against `Counties_Georgia.geojson`:
 This is not a small edge case. It is a fundamental geo-integrity problem.
 This pattern is large enough that a bad join or systematically misaligned coordinate workbook is more likely than a handful of isolated bad points.
 
+Refined interpretation from the stricter workbook audit:
+
+- duplicate coordinates do exist, but they do **not** explain the problem away
+- after collapsing repeated rows to unique facilities, the county mismatch rate still remains about `90%`
+- even after removing the entire duplicate-coordinate subset, the remaining non-duplicate facilities still mismatch at about `94%`
+
+So the core issue is not just multi-role duplication. The stronger evidence points to a broken join, contaminated workbook, mixed facility/HQ records, or a combination of those upstream problems.
+
 ### Required Fail-Fast Thresholds
 
 The ingestion pipeline should not be allowed to “succeed” while silently dropping a large fraction of the dataset.
@@ -98,6 +121,12 @@ Recommended thresholds:
 - if `county_mismatch_rate > 5%` to `10%` -> fail ingestion and require join/coordinate fix
 
 Given the current observed rates, the present build should fail this gate rather than proceed.
+
+Research-grade interpretation:
+
+- these thresholds are not optional hygiene checks
+- they are stop conditions that prevent the system from publishing geometry-backed claims from a corrupted geo layer
+- if they are exceeded, ingestion should fail loudly and require a data fix rather than silently proceeding with quarantine
 
 ### Concrete Coordinate Evidence
 
@@ -377,6 +406,7 @@ This must begin with a coordinate-join audit, not immediate quarantine.
     - `outside_ga_rate > 1%` -> fail ingestion
     - `county_mismatch_rate > 5%` to `10%` -> fail ingestion
   - Exclude quarantined rows from DuckDB, FAISS, and UI payloads
+  - Do not mark the pipeline “healthy” if the join audit fails, even if a small quarantine-safe subset exists
 
 ### P0.1 Add county GeoJSON overlay and county dropdown
 
@@ -460,6 +490,9 @@ This must begin with a coordinate-join audit, not immediate quarantine.
     - county distance -> geometry lookup
     - zero-count gap -> deterministic analytic table
   - Reserve `llm_synthesis` only for narration over already-computed deterministic evidence
+  - Define `llm_synthesis` operationally as:
+    - LLM after deterministic `GEO:` and/or `ANALYTIC:` evidence has already been produced
+    - never LLM-only county reasoning
   - Never let the LLM invent the county set, gap set, or county-distance result
 
 ### P0.5 Replace generic citations with stable evidence IDs
@@ -475,6 +508,7 @@ This must begin with a coordinate-join audit, not immediate quarantine.
     - `DOC:<chunk_id>`
     - `GEO:within_miles_of_county|county=<county>|company=<slug>|dist_mi=<value>|crs=EPSG:5070`
     - `ANALYTIC:<table>|<county>|<metric>`
+  - Prefer evidence IDs that expose the computed value, the target geography, and the CRS so the claim is directly auditable
   - Carry these ids into:
     - retrieved chunk records
     - answer prompt

@@ -1,12 +1,16 @@
 # Change List
 
+Current status: not ok for a research-grade or professor-defensible deployment.
+The geo layer should be treated as unsafe until the coordinate join audit passes and the fail-fast geo gate is enforced.
+
 ## P0
 
-- Add a coordinate-join audit in `backend/ingestion.py` before quarantine:
+- Add a coordinate-join audit in `backend/ingestion.py` before quarantine, and make it the first ingestion gate:
   - join key used
   - match rate
   - duplicate key count
   - examples of mismatched company/address/coordinate pairs
+  - do not treat a small quarantine-safe subset as success if the upstream join audit fails
 - Add the P0.0 geo correctness gate in `backend/ingestion.py`: compute `computed_county` via point-in-polygon, quarantine invalid rows, write `geo_validation_report.csv` plus mismatch-rate summary, and fail ingestion if:
   - `outside_ga_rate > 1%`
   - `county_mismatch_rate > 5%` to `10%`

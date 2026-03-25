@@ -1,0 +1,10 @@
+company_name,labeled_location,address,latitude,longitude,labeled_county,address_city,address_state
+Hanon Systems USA LLC,"Griffin, Spalding County","400 Hanon Dr, Shorter, GA 36075",32.4705166,-85.8969782,Spalding,Shorter,GA
+Hitachi Astemo,"Fayetteville, Fayette County","400 Hanon Dr, Shorter, GA 36075",32.4705166,-85.8969782,Fayette,Shorter,GA
+Hitachi Astemo Americas Inc.,Coweta County,"400 Hanon Dr, Shorter, GA 36075",32.4705166,-85.8969782,Coweta,Shorter,GA
+Hyundai & LG Energy Solution (LGES),"Cumming, Forsyth County","700 Hyundai Blvd, Ellabell, GA 31308",22.093612,82.149816,Forsyth,Ellabell,GA
+Hyundai Industrial Co.,"Valdosta, Lowndes County","700 Hyundai Blvd, Ellabell, GA 31308",22.093612,82.149816,Lowndes,Ellabell,GA
+Michelin Tread Technologies,"Lawrenceville, Gwinnett County","1 Parkway South Blvd, Greenville, SC 29615",34.8611177082749,-82.258199703858,Gwinnett,Greenville,SC
+Morgan Corp.,"Lawrenceville, Gwinnett County","15 Morgan Center Dr, Morganton, NC 28655",35.754058,-81.667538,Gwinnett,Morganton,NC
+Volvo Cars USA,Georgia,"1800 Volvo Place, Mahwah, NJ 07430",41.0740427635951,-74.1712478395491,,Mahwah,NJ
+Volvo Group North America,Georgia,"7900 National Service Rd, Greensboro, NC 27409",36.0818642621738,-79.9684288843386,,Greensboro,NC

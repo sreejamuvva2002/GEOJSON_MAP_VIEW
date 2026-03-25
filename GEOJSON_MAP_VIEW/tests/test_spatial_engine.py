@@ -30,8 +30,8 @@ def _build_spatial_db(db_path: Path) -> None:
                 "primary_oems": "Ford",
                 "employment": 100,
                 "product_service": "Cells",
-                "latitude": 32.5,
-                "longitude": -83.5,
+                "latitude": 32.6,
+                "longitude": -83.6,
                 "coordinate_source": "test",
                 "geo_usable": True,
                 "geo_validated": True,
@@ -89,5 +89,20 @@ def test_projected_county_distance_orders_results(tmp_path: Path) -> None:
 
     results = engine.companies_within_miles_of_county("Alpha", miles=30)
     assert list(results["company"]) == ["Alpha Inside", "Beta Near Alpha"]
-    assert float(results.iloc[0]["distance_miles"]) == 0.0
+    assert float(results.iloc[0]["distance_miles"]) > 0.0
+    assert float(results.iloc[0]["filter_distance_miles"]) == 0.0
+    assert float(results.iloc[0]["distance_to_boundary_miles"]) > 0.0
     assert float(results.iloc[1]["distance_miles"]) > 10.0
+    assert float(results.iloc[1]["distance_to_boundary_miles"]) > 10.0
+
+
+def test_county_membership_returns_centroid_distance(tmp_path: Path) -> None:
+    db_path = tmp_path / "spatial.duckdb"
+    _build_spatial_db(db_path)
+    engine = SpatialEngine(db_path=db_path, geojson_path=_sample_geojson_path())
+
+    results = engine.companies_in_county("Alpha")
+    assert list(results["company"]) == ["Alpha Inside"]
+    assert str(results.iloc[0]["distance_method"]) == "county_centroid_geodesic"
+    assert float(results.iloc[0]["distance_miles"]) > 0.0
+    assert float(results.iloc[0]["distance_to_boundary_miles"]) > 0.0

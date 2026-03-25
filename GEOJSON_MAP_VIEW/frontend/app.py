@@ -4,6 +4,7 @@ import json
 import os
 import socket
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -16,12 +17,15 @@ import pandas as pd
 import pydeck as pdk
 import streamlit as st
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from backend.geo_utils import canonical_county_display_name, normalize_county_name
 
 st.set_page_config(page_title="Hybrid Geospatial RAG Chatbot", layout="wide")
 
 BACKEND_CHAT_URL = os.getenv("BACKEND_CHAT_URL", "http://127.0.0.1:8000/chat")
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CHAT_TIMEOUT_SECONDS = int(os.getenv("BACKEND_CHAT_TIMEOUT", "120"))
 BACKEND_STARTUP_TIMEOUT_SECONDS = int(os.getenv("BACKEND_STARTUP_TIMEOUT", "35"))
 AUTO_BACKEND_PORTS = [8000, 8001, 8002]
@@ -269,6 +273,12 @@ def render_table(records: List[Dict], title: str = "**Retrieved Results**") -> N
         "employment",
         "distance_miles",
         "distance_km",
+        "distance_reference",
+        "filter_distance_miles",
+        "filter_distance_km",
+        "filter_distance_reference",
+        "distance_to_boundary_miles",
+        "distance_to_boundary_km",
         "coordinate_source",
         "score",
     ]
@@ -288,14 +298,38 @@ def _filtered_records(records: List[Dict], selected_county: Optional[str]) -> pd
     return df
 
 
+def _map_points_df(records: List[Dict], selected_county: Optional[str]) -> pd.DataFrame:
+    filtered_df = _filtered_records(records, selected_county)
+    point_df = filtered_df.copy() if not filtered_df.empty else pd.DataFrame(records).copy()
+    if point_df.empty or not {"latitude", "longitude"}.issubset(point_df.columns):
+        return pd.DataFrame()
+    if "geo_usable" in point_df.columns:
+        point_df = point_df[point_df["geo_usable"].fillna(False).astype(bool)].copy()
+    point_df["latitude"] = pd.to_numeric(point_df["latitude"], errors="coerce")
+    point_df["longitude"] = pd.to_numeric(point_df["longitude"], errors="coerce")
+    point_df = point_df.dropna(subset=["latitude", "longitude"]).copy()
+    return point_df
+
+
+def should_render_map(records: List[Dict], selected_county: Optional[str], route_type: Optional[str]) -> bool:
+    if not records:
+        return False
+    if str(route_type or "").strip().lower() not in {"lookup", "analytic_local"}:
+        return False
+    return not _map_points_df(records, selected_county).empty
+
+
 def render_map(records: List[Dict], selected_county: Optional[str]) -> None:
+    point_seed_df = _map_points_df(records, selected_county)
+    if point_seed_df.empty:
+        return
+
     geojson = load_county_geojson()
     summary_df = load_county_summary()
     features = geojson.get("features", [])
     selected_key = normalize_county_name(selected_county) if selected_county and selected_county != "All Counties" else None
 
     record_df = pd.DataFrame(records).copy()
-    filtered_df = _filtered_records(records, selected_county)
     filtered_counts = {}
     role_summary = {}
     category_summary = {}
@@ -335,6 +369,14 @@ def render_map(records: List[Dict], selected_county: Optional[str]) -> None:
         else:
             props["fill_color"] = [203, 214, 221, 70]
 
+        # Mirror tooltip fields onto the top-level feature object so pydeck
+        # can interpolate them consistently for GeoJSON hover tooltips.
+        feature["county_name"] = props["county_name"]
+        feature["total_count"] = total_count
+        feature["filtered_count"] = filtered_count
+        feature["role_summary"] = props["role_summary"]
+        feature["category_summary"] = props["category_summary"]
+
     county_layer = pdk.Layer(
         "GeoJsonLayer",
         data=geojson,
@@ -349,38 +391,36 @@ def render_map(records: List[Dict], selected_county: Optional[str]) -> None:
     )
 
     layers = [county_layer]
-    point_df = filtered_df.copy() if not filtered_df.empty else pd.DataFrame(records).copy()
-    if not point_df.empty and {"latitude", "longitude"}.issubset(point_df.columns):
-        if "geo_usable" in point_df.columns:
-            geo_mask = point_df["geo_usable"].fillna(False).astype(bool)
-            if geo_mask.any():
-                point_df = point_df[geo_mask].copy()
-        point_df["latitude"] = pd.to_numeric(point_df["latitude"], errors="coerce")
-        point_df["longitude"] = pd.to_numeric(point_df["longitude"], errors="coerce")
-        point_df = point_df.dropna(subset=["latitude", "longitude"]).copy()
-        if not point_df.empty:
-            point_df["map_weight"] = pd.to_numeric(point_df.get("map_weight"), errors="coerce").fillna(0.5).clip(lower=0.05, upper=1.0)
-            point_df["radius"] = point_df["map_weight"].apply(lambda v: 2500.0 + float(v) * 18000.0)
-            point_df["fill_color"] = point_df["map_weight"].apply(lambda v: [18, 75, 120, int(140 + min(100, v * 70))])
-            point_df["tooltip_company"] = point_df.get("company", pd.Series(index=point_df.index)).fillna("Unknown company")
-            point_df["tooltip_role"] = point_df.get("ev_supply_chain_role", pd.Series(index=point_df.index)).fillna("Unknown role")
-            point_df["tooltip_category"] = point_df.get("category", pd.Series(index=point_df.index)).fillna("Unknown category")
-            point_df["tooltip_county"] = point_df.get("county", pd.Series(index=point_df.index)).fillna("Unknown county")
-            point_df["tooltip_lat"] = point_df["latitude"].apply(lambda v: f"{float(v):.5f}")
-            point_df["tooltip_lon"] = point_df["longitude"].apply(lambda v: f"{float(v):.5f}")
-            point_layer = pdk.Layer(
-                "ScatterplotLayer",
-                data=point_df,
-                get_position="[longitude, latitude]",
-                get_fill_color="fill_color",
-                get_line_color=[21, 31, 43, 180],
-                line_width_min_pixels=1,
-                stroked=True,
-                filled=True,
-                pickable=True,
-                get_radius="radius",
-            )
-            layers.append(point_layer)
+    point_df = point_seed_df.copy()
+    if "county_key" not in point_df.columns and "county" in point_df.columns:
+        point_df["county_key"] = point_df["county"].apply(normalize_county_name)
+    point_df["county_name"] = point_df.get("county", pd.Series(index=point_df.index)).fillna("Unknown county")
+    point_df["total_count"] = point_df["county_key"].map(total_lookup).fillna(0).astype(int)
+    point_df["filtered_count"] = point_df["county_key"].map(filtered_counts).fillna(0).astype(int)
+    point_df["role_summary"] = point_df["county_key"].map(role_summary).fillna("No retrieved roles")
+    point_df["category_summary"] = point_df["county_key"].map(category_summary).fillna("No retrieved categories")
+    point_df["map_weight"] = pd.to_numeric(point_df.get("map_weight"), errors="coerce").fillna(0.5).clip(lower=0.05, upper=1.0)
+    point_df["radius"] = point_df["map_weight"].apply(lambda v: 2500.0 + float(v) * 18000.0)
+    point_df["fill_color"] = point_df["map_weight"].apply(lambda v: [18, 75, 120, int(140 + min(100, v * 70))])
+    point_df["tooltip_company"] = point_df.get("company", pd.Series(index=point_df.index)).fillna("Unknown company")
+    point_df["tooltip_role"] = point_df.get("ev_supply_chain_role", pd.Series(index=point_df.index)).fillna("Unknown role")
+    point_df["tooltip_category"] = point_df.get("category", pd.Series(index=point_df.index)).fillna("Unknown category")
+    point_df["tooltip_county"] = point_df.get("county", pd.Series(index=point_df.index)).fillna("Unknown county")
+    point_df["tooltip_lat"] = point_df["latitude"].apply(lambda v: f"{float(v):.5f}")
+    point_df["tooltip_lon"] = point_df["longitude"].apply(lambda v: f"{float(v):.5f}")
+    point_layer = pdk.Layer(
+        "ScatterplotLayer",
+        data=point_df,
+        get_position="[longitude, latitude]",
+        get_fill_color="fill_color",
+        get_line_color=[21, 31, 43, 180],
+        line_width_min_pixels=1,
+        stroked=True,
+        filled=True,
+        pickable=True,
+        get_radius="radius",
+    )
+    layers.append(point_layer)
 
     view_state = pdk.ViewState(latitude=32.75, longitude=-83.4, zoom=6.3, pitch=0)
     tooltip = {
@@ -411,6 +451,24 @@ def render_map(records: List[Dict], selected_county: Optional[str]) -> None:
         ),
         use_container_width=True,
     )
+
+
+def render_assistant_message(msg: Dict) -> None:
+    st.markdown(msg["content"])
+    st.caption(
+        f"Model: {msg.get('model_used', 'unknown')} | Route: {msg.get('route_type', 'unknown')} | Mode: {msg.get('mode', 'unknown')}"
+    )
+
+
+def render_assistant_details(msg: Dict, include_map: bool = True) -> None:
+    render_sources(msg.get("sources", []))
+    render_chunks(msg.get("retrieved_chunks", []))
+
+    message_selected_county = msg.get("selected_county")
+    if include_map and should_render_map(msg.get("retrieved_companies", []), message_selected_county, msg.get("route_type")):
+        render_map(msg.get("retrieved_companies", []), message_selected_county)
+
+    render_table(msg.get("retrieved_companies", []))
 
 
 st.title("Hybrid Geospatial RAG Chatbot")
@@ -454,15 +512,19 @@ with st.sidebar:
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-for msg in st.session_state.messages:
+assistant_positions = [idx for idx, message in enumerate(st.session_state.messages) if message.get("role") == "assistant"]
+latest_assistant_position = assistant_positions[-1] if assistant_positions else None
+assistant_counter = 0
+for idx, msg in enumerate(st.session_state.messages):
     with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
         if msg["role"] == "assistant":
-            st.caption(f"Route: {msg.get('route_type', 'unknown')} | Mode: {msg.get('mode', 'unknown')}")
-            render_sources(msg.get("sources", []))
-            render_chunks(msg.get("retrieved_chunks", []))
-            render_map(msg.get("retrieved_companies", []), st.session_state.get("selected_county"))
-            render_table(msg.get("retrieved_companies", []))
+            render_assistant_message(msg)
+        else:
+            st.markdown(msg["content"])
+    if msg["role"] == "assistant":
+        assistant_counter += 1
+        with st.expander(f"Details for response {assistant_counter}", expanded=False):
+            render_assistant_details(msg, include_map=(idx == latest_assistant_position))
 
 user_question = st.chat_input("Ask a question about GNEM companies and geospatial relationships...")
 
@@ -471,52 +533,40 @@ if user_question:
     with st.chat_message("user"):
         st.markdown(user_question)
 
-    with st.chat_message("assistant"):
-        try:
-            with st.spinner("Running deterministic geo/analytic routing plus evidence retrieval..."):
-                result = call_backend(
-                    user_question,
-                    None if st.session_state.get("selected_county") == "All Counties" else st.session_state.get("selected_county"),
-                )
-            answer = result.get("answer", "No answer returned.")
-            sources = result.get("sources", [])
-            retrieved_chunks = result.get("retrieved_chunks", [])
-            retrieved_companies = result.get("retrieved_companies", [])
-            model_used = result.get("model_used", "unknown")
-            route_type = result.get("route_type", "unknown")
-            mode = result.get("mode", "unknown")
+    try:
+        with st.spinner("Running deterministic geo/analytic routing plus evidence retrieval..."):
+            message_selected_county = None if st.session_state.get("selected_county") == "All Counties" else st.session_state.get("selected_county")
+            result = call_backend(user_question, message_selected_county)
 
-            st.markdown(answer)
-            st.caption(f"Model: {model_used} | Route: {route_type} | Mode: {mode}")
-            render_sources(sources)
-            render_chunks(retrieved_chunks)
-            render_map(retrieved_companies, st.session_state.get("selected_county"))
-            render_table(retrieved_companies)
-
-            st.session_state.messages.append(
-                {
-                    "role": "assistant",
-                    "content": answer,
-                    "sources": sources,
-                    "retrieved_chunks": retrieved_chunks,
-                    "retrieved_companies": retrieved_companies,
-                    "route_type": route_type,
-                    "mode": mode,
-                }
-            )
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="ignore")
-            st.error(f"Backend HTTP error: {exc.code} - {detail}")
-            tail = _backend_log_tail()
-            if tail:
-                st.code(tail, language="text")
-        except urllib.error.URLError as exc:
-            st.error(f"Backend connection failed: {exc.reason}")
-            tail = _backend_log_tail()
-            if tail:
-                st.code(tail, language="text")
-        except Exception as exc:
-            st.error(f"Unexpected error: {exc}")
-            tail = _backend_log_tail()
-            if tail:
-                st.code(tail, language="text")
+        assistant_message = {
+            "role": "assistant",
+            "content": result.get("answer", "No answer returned."),
+            "sources": result.get("sources", []),
+            "retrieved_chunks": result.get("retrieved_chunks", []),
+            "retrieved_companies": result.get("retrieved_companies", []),
+            "route_type": result.get("route_type", "unknown"),
+            "mode": result.get("mode", "unknown"),
+            "model_used": result.get("model_used", "unknown"),
+            "selected_county": message_selected_county,
+        }
+        st.session_state.messages.append(assistant_message)
+        with st.chat_message("assistant"):
+            render_assistant_message(assistant_message)
+        with st.expander(f"Details for response {assistant_counter + 1}", expanded=True):
+            render_assistant_details(assistant_message, include_map=True)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")
+        st.error(f"Backend HTTP error: {exc.code} - {detail}")
+        tail = _backend_log_tail()
+        if tail:
+            st.code(tail, language="text")
+    except urllib.error.URLError as exc:
+        st.error(f"Backend connection failed: {exc.reason}")
+        tail = _backend_log_tail()
+        if tail:
+            st.code(tail, language="text")
+    except Exception as exc:
+        st.error(f"Unexpected error: {exc}")
+        tail = _backend_log_tail()
+        if tail:
+            st.code(tail, language="text")

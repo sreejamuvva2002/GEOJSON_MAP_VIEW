@@ -9,6 +9,7 @@ from geopy.distance import distance as geopy_distance
 
 from backend.geo_utils import (
     PROJECTED_CRS,
+    compute_point_to_county_boundary_distance_miles,
     compute_point_to_county_distance_miles as compute_projected_distance_miles,
     load_county_geometries,
     normalize_county_name,
@@ -184,10 +185,32 @@ class SpatialEngine:
             return pd.DataFrame(columns=list(base.columns))
 
         out = base[base["county_key"].fillna("").astype(str) == county_key].copy()
-        out["distance_miles"] = 0.0
-        out["distance_km"] = 0.0
-        out["distance_method"] = f"polygon_containment:{PROJECTED_CRS}"
-        return out.sort_values(["company"], ascending=[True]).reset_index(drop=True)
+        county = resolve_county_geometry(self.county_index, county_name)
+        if county is None or out.empty:
+            return out.reset_index(drop=True)
+
+        centroid = (float(county.centroid_latitude), float(county.centroid_longitude))
+        out["distance_miles"] = out.apply(
+            lambda row: geopy_distance(centroid, (float(row["latitude"]), float(row["longitude"]))).miles,
+            axis=1,
+        )
+        out["distance_km"] = out["distance_miles"] * 1.60934
+        out["distance_to_boundary_miles"] = out.apply(
+            lambda row: compute_point_to_county_boundary_distance_miles(
+                self.county_index,
+                latitude=float(row["latitude"]),
+                longitude=float(row["longitude"]),
+                county_name=county.county_name,
+            ),
+            axis=1,
+        )
+        out["distance_to_boundary_km"] = out["distance_to_boundary_miles"] * 1.60934
+        out["filter_distance_miles"] = 0.0
+        out["filter_distance_km"] = 0.0
+        out["distance_method"] = "county_centroid_geodesic"
+        out["distance_reference"] = f"{county.county_name} County centroid"
+        out["filter_distance_reference"] = f"{county.county_name} County polygon"
+        return out.sort_values(["distance_miles", "company"], ascending=[True, True]).reset_index(drop=True)
 
     def compute_point_to_county_distance_miles(
         self,
@@ -217,7 +240,8 @@ class SpatialEngine:
         if base.empty:
             return base
 
-        base["distance_miles"] = base.apply(
+        centroid = (float(county.centroid_latitude), float(county.centroid_longitude))
+        base["filter_distance_miles"] = base.apply(
             lambda row: self.compute_point_to_county_distance_miles(
                 latitude=float(row["latitude"]),
                 longitude=float(row["longitude"]),
@@ -225,8 +249,33 @@ class SpatialEngine:
             ),
             axis=1,
         )
+        base["filter_distance_km"] = base["filter_distance_miles"] * 1.60934
+        base["distance_to_boundary_miles"] = base.apply(
+            lambda row: compute_point_to_county_boundary_distance_miles(
+                self.county_index,
+                latitude=float(row["latitude"]),
+                longitude=float(row["longitude"]),
+                county_name=county.county_name,
+            ),
+            axis=1,
+        )
+        base["distance_to_boundary_km"] = base["distance_to_boundary_miles"] * 1.60934
+        base["distance_miles"] = base.apply(
+            lambda row: (
+                geopy_distance(centroid, (float(row["latitude"]), float(row["longitude"]))).miles
+                if float(row["filter_distance_miles"] or 0.0) == 0.0
+                else float(row["filter_distance_miles"])
+            ),
+            axis=1,
+        )
         base["distance_km"] = base["distance_miles"] * 1.60934
         base["distance_method"] = f"polygon_distance:{PROJECTED_CRS}"
-        within = base[base["distance_miles"].fillna(float("inf")) <= float(miles)].copy()
-        within = within.sort_values(["distance_miles", "company"], ascending=[True, True]).reset_index(drop=True)
+        base["distance_reference"] = base["filter_distance_miles"].apply(
+            lambda value: f"{county.county_name} County centroid"
+            if float(value or 0.0) == 0.0
+            else f"{county.county_name} County polygon"
+        )
+        base["filter_distance_reference"] = f"{county.county_name} County polygon"
+        within = base[base["filter_distance_miles"].fillna(float("inf")) <= float(miles)].copy()
+        within = within.sort_values(["filter_distance_miles", "distance_miles", "company"], ascending=[True, True, True]).reset_index(drop=True)
         return within

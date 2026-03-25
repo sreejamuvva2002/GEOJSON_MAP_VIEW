@@ -677,12 +677,20 @@ class HybridGeospatialRAGPipeline:
                 "company_id": company_slug,
                 "company": company,
                 "dist_mi": distance_mi,
+                "filter_dist_mi": None if pd.isna(row.get("filter_distance_miles")) else float(row.get("filter_distance_miles")),
+                "boundary_dist_mi": None if pd.isna(row.get("distance_to_boundary_miles")) else float(row.get("distance_to_boundary_miles")),
                 "crs": PROJECTED_CRS if "polygon" in method else "geodesic",
                 "method": method,
+                "distance_reference": row.get("distance_reference"),
+                "filter_distance_reference": row.get("filter_distance_reference"),
             }
+            if method == "county_centroid_geodesic":
+                distance_text = f"distance_miles_from_centroid={distance_mi if distance_mi is not None else 0.0:.2f}"
+            else:
+                distance_text = f"distance_miles={distance_mi if distance_mi is not None else 0.0:.2f}"
             text = (
                 f"{company} in {row.get('city') or 'Unknown city'}, {county}; "
-                f"distance_miles={distance_mi if distance_mi is not None else 0.0:.2f}; "
+                f"{distance_text}; "
                 f"coordinate_source={row.get('coordinate_source') or 'unknown'}."
             )
             chunks.append(
@@ -851,7 +859,7 @@ class HybridGeospatialRAGPipeline:
             )
         elif county_name:
             lines.append(
-                f"- Found {len(df)} geo-usable companies in {county_name} County by point-in-polygon county membership. [{retrieved_chunks[0]['evidence_id']}]"
+                f"- Found {len(df)} geo-usable companies in {county_name} County by point-in-polygon county membership. Distance values are geodesic from the county centroid. [{retrieved_chunks[0]['evidence_id']}]"
             )
         else:
             lines.append(
@@ -861,8 +869,21 @@ class HybridGeospatialRAGPipeline:
         for chunk in retrieved_chunks[:5]:
             company = chunk.get("company") or "Unknown company"
             dist_mi = chunk["meta"].get("dist_mi")
+            method = str(chunk["meta"].get("method") or "")
+            filter_dist_mi = chunk["meta"].get("filter_dist_mi")
+            boundary_dist_mi = chunk["meta"].get("boundary_dist_mi")
             if dist_mi is not None:
-                lines.append(f"- {company} at {dist_mi:.2f} miles. [{chunk['evidence_id']}]")
+                if method == "county_centroid_geodesic":
+                    lines.append(f"- {company} at {dist_mi:.2f} miles from the county centroid. [{chunk['evidence_id']}]")
+                elif method.startswith("polygon_distance:"):
+                    if filter_dist_mi is not None and float(filter_dist_mi) == 0.0:
+                        lines.append(
+                            f"- {company} is inside the county region; {dist_mi:.2f} miles from the county centroid and {boundary_dist_mi if boundary_dist_mi is not None else 0.0:.2f} miles from the county boundary. [{chunk['evidence_id']}]"
+                        )
+                    else:
+                        lines.append(f"- {company} has polygon distance {dist_mi:.2f} miles to the county region. [{chunk['evidence_id']}]")
+                else:
+                    lines.append(f"- {company} at {dist_mi:.2f} miles. [{chunk['evidence_id']}]")
             else:
                 lines.append(f"- {company}. [{chunk['evidence_id']}]")
         return "\n".join(lines)

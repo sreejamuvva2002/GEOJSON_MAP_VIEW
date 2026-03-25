@@ -269,3 +269,19 @@ def compute_point_to_county_distance_miles(
     projected_point = project_geometry(point)
     distance_meters = float(projected_point.distance(county.projected_geometry))
     return distance_meters * METERS_TO_MILES
+
+
+def compute_point_to_county_boundary_distance_miles(
+    county_index: CountyGeometryIndex,
+    latitude: float,
+    longitude: float,
+    county_name: object,
+) -> Optional[float]:
+    county = resolve_county_geometry(county_index, county_name)
+    if county is None:
+        return None
+
+    point = Point(float(longitude), float(latitude))
+    projected_point = project_geometry(point)
+    distance_meters = float(projected_point.distance(county.projected_geometry.boundary))
+    return distance_meters * METERS_TO_MILES

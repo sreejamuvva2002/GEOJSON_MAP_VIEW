@@ -22,6 +22,14 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from backend.geo_utils import canonical_county_display_name, normalize_county_name
+from frontend.map_utils import (
+    effective_map_county,
+    lookup_geo_anchor,
+    map_points_df,
+    map_view_state_config,
+    point_radius_polygon,
+    should_render_map,
+)
 
 st.set_page_config(page_title="Hybrid Geospatial RAG Chatbot", layout="wide")
 
@@ -286,48 +294,18 @@ def render_table(records: List[Dict], title: str = "**Retrieved Results**") -> N
     st.dataframe(df[ordered], use_container_width=True)
 
 
-def _filtered_records(records: List[Dict], selected_county: Optional[str]) -> pd.DataFrame:
-    df = pd.DataFrame(records).copy()
-    if df.empty or not selected_county or selected_county == "All Counties":
-        return df
-    county_key = normalize_county_name(selected_county)
-    if "county_key" in df.columns:
-        return df[df["county_key"].fillna("").astype(str) == county_key].copy()
-    if "county" in df.columns:
-        return df[df["county"].fillna("").apply(normalize_county_name) == county_key].copy()
-    return df
-
-
-def _map_points_df(records: List[Dict], selected_county: Optional[str]) -> pd.DataFrame:
-    filtered_df = _filtered_records(records, selected_county)
-    point_df = filtered_df.copy() if not filtered_df.empty else pd.DataFrame(records).copy()
-    if point_df.empty or not {"latitude", "longitude"}.issubset(point_df.columns):
-        return pd.DataFrame()
-    if "geo_usable" in point_df.columns:
-        point_df = point_df[point_df["geo_usable"].fillna(False).astype(bool)].copy()
-    point_df["latitude"] = pd.to_numeric(point_df["latitude"], errors="coerce")
-    point_df["longitude"] = pd.to_numeric(point_df["longitude"], errors="coerce")
-    point_df = point_df.dropna(subset=["latitude", "longitude"]).copy()
-    return point_df
-
-
-def should_render_map(records: List[Dict], selected_county: Optional[str], route_type: Optional[str]) -> bool:
-    if not records:
-        return False
-    if str(route_type or "").strip().lower() not in {"lookup", "analytic_local"}:
-        return False
-    return not _map_points_df(records, selected_county).empty
-
-
-def render_map(records: List[Dict], selected_county: Optional[str]) -> None:
-    point_seed_df = _map_points_df(records, selected_county)
-    if point_seed_df.empty:
+def render_map(records: List[Dict], selected_county: Optional[str], plan: Optional[Dict] = None) -> None:
+    map_selected_county = effective_map_county(selected_county, plan)
+    point_seed_df = map_points_df(records, map_selected_county)
+    anchor = lookup_geo_anchor(plan)
+    if point_seed_df.empty and anchor is None:
         return
 
     geojson = load_county_geojson()
     summary_df = load_county_summary()
     features = geojson.get("features", [])
-    selected_key = normalize_county_name(selected_county) if selected_county and selected_county != "All Counties" else None
+    selected_key = normalize_county_name(map_selected_county) if map_selected_county and map_selected_county != "All Counties" else None
+    plan_hints = dict(plan.get("hints", {})) if isinstance(plan, dict) and isinstance(plan.get("hints", {}), dict) else {}
 
     record_df = pd.DataFrame(records).copy()
     filtered_counts = {}
@@ -391,38 +369,93 @@ def render_map(records: List[Dict], selected_county: Optional[str]) -> None:
     )
 
     layers = [county_layer]
-    point_df = point_seed_df.copy()
-    if "county_key" not in point_df.columns and "county" in point_df.columns:
-        point_df["county_key"] = point_df["county"].apply(normalize_county_name)
-    point_df["county_name"] = point_df.get("county", pd.Series(index=point_df.index)).fillna("Unknown county")
-    point_df["total_count"] = point_df["county_key"].map(total_lookup).fillna(0).astype(int)
-    point_df["filtered_count"] = point_df["county_key"].map(filtered_counts).fillna(0).astype(int)
-    point_df["role_summary"] = point_df["county_key"].map(role_summary).fillna("No retrieved roles")
-    point_df["category_summary"] = point_df["county_key"].map(category_summary).fillna("No retrieved categories")
-    point_df["map_weight"] = pd.to_numeric(point_df.get("map_weight"), errors="coerce").fillna(0.5).clip(lower=0.05, upper=1.0)
-    point_df["radius"] = point_df["map_weight"].apply(lambda v: 2500.0 + float(v) * 18000.0)
-    point_df["fill_color"] = point_df["map_weight"].apply(lambda v: [18, 75, 120, int(140 + min(100, v * 70))])
-    point_df["tooltip_company"] = point_df.get("company", pd.Series(index=point_df.index)).fillna("Unknown company")
-    point_df["tooltip_role"] = point_df.get("ev_supply_chain_role", pd.Series(index=point_df.index)).fillna("Unknown role")
-    point_df["tooltip_category"] = point_df.get("category", pd.Series(index=point_df.index)).fillna("Unknown category")
-    point_df["tooltip_county"] = point_df.get("county", pd.Series(index=point_df.index)).fillna("Unknown county")
-    point_df["tooltip_lat"] = point_df["latitude"].apply(lambda v: f"{float(v):.5f}")
-    point_df["tooltip_lon"] = point_df["longitude"].apply(lambda v: f"{float(v):.5f}")
-    point_layer = pdk.Layer(
-        "ScatterplotLayer",
-        data=point_df,
-        get_position="[longitude, latitude]",
-        get_fill_color="fill_color",
-        get_line_color=[21, 31, 43, 180],
-        line_width_min_pixels=1,
-        stroked=True,
-        filled=True,
-        pickable=True,
-        get_radius="radius",
-    )
-    layers.append(point_layer)
+    if anchor and anchor.get("type") == "point":
+        polygon = point_radius_polygon(anchor)
+        if polygon:
+            radius_df = pd.DataFrame([{"polygon": polygon}])
+            radius_layer = pdk.Layer(
+                "PolygonLayer",
+                data=radius_df,
+                get_polygon="polygon",
+                get_fill_color=[237, 167, 52, 26],
+                get_line_color=[237, 167, 52, 190],
+                line_width_min_pixels=2,
+                stroked=True,
+                filled=True,
+                pickable=False,
+            )
+            layers.append(radius_layer)
 
-    view_state = pdk.ViewState(latitude=32.75, longitude=-83.4, zoom=6.3, pitch=0)
+    point_df = point_seed_df.copy()
+    if not point_df.empty:
+        if "county_key" not in point_df.columns and "county" in point_df.columns:
+            point_df["county_key"] = point_df["county"].apply(normalize_county_name)
+        point_df["county_name"] = point_df.get("county", pd.Series(index=point_df.index)).fillna("Unknown county")
+        point_df["total_count"] = point_df["county_key"].map(total_lookup).fillna(0).astype(int)
+        point_df["filtered_count"] = point_df["county_key"].map(filtered_counts).fillna(0).astype(int)
+        point_df["role_summary"] = point_df["county_key"].map(role_summary).fillna("No retrieved roles")
+        point_df["category_summary"] = point_df["county_key"].map(category_summary).fillna("No retrieved categories")
+        point_df["map_weight"] = pd.to_numeric(point_df.get("map_weight"), errors="coerce").fillna(0.5).clip(lower=0.05, upper=1.0)
+        point_df["radius"] = point_df["map_weight"].apply(lambda v: 2500.0 + float(v) * 18000.0)
+        point_df["fill_color"] = point_df["map_weight"].apply(lambda v: [18, 75, 120, int(140 + min(100, v * 70))])
+        point_df["tooltip_company"] = point_df.get("company", pd.Series(index=point_df.index)).fillna("Unknown company")
+        point_df["tooltip_role"] = point_df.get("ev_supply_chain_role", pd.Series(index=point_df.index)).fillna("Unknown role")
+        point_df["tooltip_category"] = point_df.get("category", pd.Series(index=point_df.index)).fillna("Unknown category")
+        point_df["tooltip_county"] = point_df.get("county", pd.Series(index=point_df.index)).fillna("Unknown county")
+        point_df["tooltip_lat"] = point_df["latitude"].apply(lambda v: f"{float(v):.5f}")
+        point_df["tooltip_lon"] = point_df["longitude"].apply(lambda v: f"{float(v):.5f}")
+        point_layer = pdk.Layer(
+            "ScatterplotLayer",
+            data=point_df,
+            get_position="[longitude, latitude]",
+            get_fill_color="fill_color",
+            get_line_color=[21, 31, 43, 180],
+            line_width_min_pixels=1,
+            stroked=True,
+            filled=True,
+            pickable=True,
+            get_radius="radius",
+        )
+        layers.append(point_layer)
+
+    if anchor and anchor.get("type") == "point":
+        radius_km = float(anchor.get("radius_km", 0.0) or 0.0)
+        anchor_df = pd.DataFrame(
+            [
+                {
+                    "latitude": float(anchor["latitude"]),
+                    "longitude": float(anchor["longitude"]),
+                    "county_name": "Search area",
+                    "total_count": int(len(point_seed_df)),
+                    "filtered_count": int(len(point_seed_df)),
+                    "role_summary": f"Radius {radius_km:.1f} km",
+                    "category_summary": "Point-radius lookup",
+                    "tooltip_company": "Search center",
+                    "tooltip_role": f"Radius: {radius_km:.1f} km",
+                    "tooltip_category": str(plan_hints.get("capability_term") or "Requested search"),
+                    "tooltip_county": "Query coordinates",
+                    "tooltip_lat": f"{float(anchor['latitude']):.5f}",
+                    "tooltip_lon": f"{float(anchor['longitude']):.5f}",
+                    "fill_color": [237, 167, 52, 235],
+                    "radius": 9500.0,
+                }
+            ]
+        )
+        anchor_layer = pdk.Layer(
+            "ScatterplotLayer",
+            data=anchor_df,
+            get_position="[longitude, latitude]",
+            get_fill_color="fill_color",
+            get_line_color=[102, 58, 0, 220],
+            line_width_min_pixels=2,
+            stroked=True,
+            filled=True,
+            pickable=True,
+            get_radius="radius",
+        )
+        layers.append(anchor_layer)
+
+    view_state = pdk.ViewState(**map_view_state_config(records, map_selected_county, plan))
     tooltip = {
         "html": (
             "<b>{county_name} County</b><br/>"
@@ -441,7 +474,16 @@ def render_map(records: List[Dict], selected_county: Optional[str]) -> None:
     }
 
     st.markdown("**Georgia County Map**")
-    st.caption("County polygons are authoritative boundaries. Point-radius uses geodesic distance; county distance uses polygon distance in EPSG:5070.")
+    if anchor and anchor.get("type") == "point":
+        st.caption(
+            "County polygons are authoritative boundaries. The orange marker and ring show the requested point-radius search; "
+            "company distances use geodesic distance."
+        )
+    else:
+        st.caption(
+            "County polygons are authoritative boundaries. Point-radius uses geodesic distance; "
+            "county distance uses polygon distance in EPSG:5070."
+        )
     st.pydeck_chart(
         pdk.Deck(
             map_style="light_no_labels",
@@ -460,13 +502,22 @@ def render_assistant_message(msg: Dict) -> None:
     )
 
 
+def render_assistant_map_preview(msg: Dict, include_map: bool = True) -> None:
+    if not include_map:
+        return
+
+    plan = msg.get("plan") if isinstance(msg.get("plan"), dict) else None
+    message_selected_county = effective_map_county(msg.get("selected_county"), plan)
+    if should_render_map(msg.get("retrieved_companies", []), message_selected_county, msg.get("route_type"), plan):
+        render_map(msg.get("retrieved_companies", []), message_selected_county, plan)
+
+
 def render_assistant_details(msg: Dict, include_map: bool = True) -> None:
     render_sources(msg.get("sources", []))
     render_chunks(msg.get("retrieved_chunks", []))
 
-    message_selected_county = msg.get("selected_county")
-    if include_map and should_render_map(msg.get("retrieved_companies", []), message_selected_county, msg.get("route_type")):
-        render_map(msg.get("retrieved_companies", []), message_selected_county)
+    if include_map:
+        render_assistant_map_preview(msg, include_map=True)
 
     render_table(msg.get("retrieved_companies", []))
 
@@ -519,12 +570,13 @@ for idx, msg in enumerate(st.session_state.messages):
     with st.chat_message(msg["role"]):
         if msg["role"] == "assistant":
             render_assistant_message(msg)
+            render_assistant_map_preview(msg, include_map=(idx == latest_assistant_position))
         else:
             st.markdown(msg["content"])
     if msg["role"] == "assistant":
         assistant_counter += 1
         with st.expander(f"Details for response {assistant_counter}", expanded=False):
-            render_assistant_details(msg, include_map=(idx == latest_assistant_position))
+            render_assistant_details(msg, include_map=False)
 
 user_question = st.chat_input("Ask a question about GNEM companies and geospatial relationships...")
 
@@ -544,6 +596,7 @@ if user_question:
             "sources": result.get("sources", []),
             "retrieved_chunks": result.get("retrieved_chunks", []),
             "retrieved_companies": result.get("retrieved_companies", []),
+            "plan": result.get("plan", {}),
             "route_type": result.get("route_type", "unknown"),
             "mode": result.get("mode", "unknown"),
             "model_used": result.get("model_used", "unknown"),
@@ -552,8 +605,9 @@ if user_question:
         st.session_state.messages.append(assistant_message)
         with st.chat_message("assistant"):
             render_assistant_message(assistant_message)
+            render_assistant_map_preview(assistant_message, include_map=True)
         with st.expander(f"Details for response {assistant_counter + 1}", expanded=True):
-            render_assistant_details(assistant_message, include_map=True)
+            render_assistant_details(assistant_message, include_map=False)
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="ignore")
         st.error(f"Backend HTTP error: {exc.code} - {detail}")

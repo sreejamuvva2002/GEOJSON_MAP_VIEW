@@ -33,7 +33,7 @@ def _build_analytics_db(db_path: Path) -> None:
     )
     companies = pd.DataFrame(
         [
-            {"company": "Alpha Inside", "county_key": "alpha", "county_id": "001", "county_fips": "001", "county": "Alpha", "city": "Alpha City", "category": "Tier 1", "industry_group": "Battery", "location": "Alpha City, Alpha County", "ev_supply_chain_role": "Battery", "primary_oems": "Ford", "employment": 100, "product_service": "Cells", "latitude": 32.5, "longitude": -83.5, "coordinate_source": "test", "geo_validated": True}
+            {"company": "Alpha Inside", "county_key": "alpha", "county_id": "001", "county_fips": "001", "county": "Alpha", "city": "Alpha City", "category": "Tier 1", "industry_group": "Battery", "location": "Alpha City, Alpha County", "ev_supply_chain_role": "Battery", "primary_oems": "Ford", "employment": 100, "product_service": "Cells", "latitude": 32.5, "longitude": -83.5, "coordinate_source": "test", "geo_usable": True, "geo_validated": True, "geo_quality_status": "geo_usable"}
         ]
     )
 

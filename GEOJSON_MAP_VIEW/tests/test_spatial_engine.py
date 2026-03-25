@@ -33,7 +33,9 @@ def _build_spatial_db(db_path: Path) -> None:
                 "latitude": 32.5,
                 "longitude": -83.5,
                 "coordinate_source": "test",
+                "geo_usable": True,
                 "geo_validated": True,
+                "geo_quality_status": "geo_usable",
             },
             {
                 "company": "Beta Near Alpha",
@@ -53,7 +55,9 @@ def _build_spatial_db(db_path: Path) -> None:
                 "latitude": 32.5,
                 "longitude": -82.8,
                 "coordinate_source": "test",
+                "geo_usable": True,
                 "geo_validated": True,
+                "geo_quality_status": "geo_usable",
             },
         ]
     )

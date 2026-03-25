@@ -1,39 +1,122 @@
-# GEOJSON Map + Geo-Aware RAG Review
+# GEOJSON + Map View + Geo-Aware RAG Review
 
 ## Scope
 
 This review is based on:
 
-- Static inspection of the full codebase
-- Targeted runtime probes of the planner, spatial engine, DuckDB contents, vector metadata, and coordinate artifacts
-- Targeted data validation against the Georgia county GeoJSON
+- Full static inspection of the repository
+- Targeted runtime probes of the planner, spatial engine, DuckDB artifacts, vector metadata, and coordinate sources
+- Polygon validation of stored company points against `data/Counties_Georgia.geojson`
 
-This is enough to evaluate correctness, fragility, reproducibility, and Summit readiness. It is not a UX/browser usability test.
+This is enough to judge correctness, fragility, reproducibility, and Summit readiness. It is not a full browser interaction test.
 
 ## Executive Verdict
 
-Short version: the repository has the **right high-level architecture**, but it does **not yet meet the full “GeoJSON + map view + geo-aware RAG queries” requirement set**.
+The repository has a solid prototype skeleton, but it does **not** currently satisfy the professor-defensible version of:
 
-What is working:
+- GeoJSON county map view
+- polygon-correct county math
+- geo-aware RAG routing
+- reproducible research pipeline
 
-- A Streamlit UI exists
-- A FastAPI backend exists
-- Company points can be shown on a map with tooltips
-- Point-radius filtering exists
-- SQL, vector, and geo retrieval are wired together
-- LLM answers include generic chunk citations
+Current state in one sentence:
 
-What is not working at the required rigor level:
+**The codebase partially demonstrates a geospatial RAG prototype, but it fails the geo-correctness gate because county polygons are not rendered in the UI, county reasoning is centroid-based rather than polygon-based, and the stored coordinates are not validated before indexing or mapping.**
 
-- The map does **not** visibly render county GeoJSON polygons
-- County-based geospatial reasoning is **centroid-based**, not polygon-based
-- County assignment is **not** computed by point-in-polygon
-- Gap/density/county analytic queries are **not** implemented as deterministic analytics
-- The coordinate source appears materially unreliable and is not validated against county polygons
-- Dependencies are unpinned, embeddings default to hash fallback, and runtime embedding fallback is silent
-- There is no test suite and no structured query/output logging
+## Bottom-Line Assessment
 
-Bottom line: **PARTIALLY MEETS the intended demo concept, but does not yet meet the geometry-correct, research-grade, professor-defensible implementation bar.**
+### What is already present
+
+- Streamlit frontend
+- FastAPI backend
+- SQL + vector + geo retrieval modules
+- Ollama-backed answer synthesis
+- Company point visualization with hover tooltips
+- Point-radius filtering via `geopy`
+
+### What is not yet professor-defensible
+
+- No visible county GeoJSON polygon overlay in the frontend
+- No county dropdown interaction
+- No point-in-polygon county assignment
+- No projected-CRS point-to-polygon county distance
+- No deterministic county analytics for zero-count gap questions
+- No transparent route types such as `lookup`, `analytic_local`, `web_needed`
+- No stable `DOC:`, `GEO:`, `ANALYTIC:` evidence IDs
+- No post-generation citation validator
+- No pinned dependencies
+- No test suite
+- No JSONL query/evidence logging
+
+## P0.0 Geo Correctness Gate
+
+### Required Gate Definition
+
+Before any UI or RAG claims are trusted, the pipeline must:
+
+1. Audit the coordinate join before quarantine:
+   - join key used
+   - match rate
+   - duplicate key count
+   - examples of mismatched company/address/coordinate pairs
+2. Compute `computed_county` for every company point using point-in-polygon against `Counties_Georgia.geojson`
+3. Quarantine any row outside Georgia polygons or any row without an assignable county
+4. If an existing county label disagrees with `computed_county`, log it
+5. Generate:
+   - `geo_validation_report.csv`
+   - mismatch-rate summary
+6. Exclude quarantined rows from:
+   - the map
+   - DuckDB analytics
+   - FAISS indexing
+   - geo retrieval
+
+### Current Gate Status: FAIL
+
+Observed from the current built artifacts:
+
+- `207` companies total in DuckDB
+- `202` rows use the external coordinate workbook
+- `4` rows still use `county_centroid`
+- `1` row is still `missing`
+
+Observed from polygon validation against `Counties_Georgia.geojson`:
+
+- `9` company points are outside all Georgia county polygons
+- `167` of `183` rows with both county labels and coordinates do **not** fall inside their labeled county polygon
+
+This is not a small edge case. It is a fundamental geo-integrity problem.
+This pattern is large enough that a bad join or systematically misaligned coordinate workbook is more likely than a handful of isolated bad points.
+
+### Required Fail-Fast Thresholds
+
+The ingestion pipeline should not be allowed to “succeed” while silently dropping a large fraction of the dataset.
+
+Recommended thresholds:
+
+- if `outside_ga_rate > 1%` -> fail ingestion and require coordinate/join fix
+- if `county_mismatch_rate > 5%` to `10%` -> fail ingestion and require join/coordinate fix
+
+Given the current observed rates, the present build should fail this gate rather than proceed.
+
+### Concrete Coordinate Evidence
+
+Examples from `data/GNEM - Auto Landscape Lat Long Updated File (1).xlsx`:
+
+- `ACM Georgia LLC`
+  - labeled location: `Calhoun, Gordon County`
+  - address: `975 Thomson Hwy, Warrenton, GA 30828`
+- `Adient`
+  - labeled location: `Ringgold, Catoosa County`
+  - address: `1700 S Progress Pkwy, West Point, GA 31833`
+- `Elan Technology Inc.`
+  - labeled location: `Atlanta, Fulton County`
+  - address: `169 Elan Court, Midway, GA 31320`
+- `Michelin Tread Technologies`
+  - labeled location: `Lawrenceville, Gwinnett County`
+  - address: `1 Parkway South Blvd, Greenville, SC 29615`
+
+These examples are enough to conclude that the current coordinate feed cannot be trusted without validation and quarantine.
 
 ## A) Repo Scan
 
@@ -62,552 +145,554 @@ GEOJSON_MAP_VIEW/
     └── vector_metadata.json
 ```
 
+### Entrypoints
+
+- Ingestion: `backend/ingestion.py`
+- API: `backend/main.py`
+- Frontend: `frontend/app.py`
+- Query planner: `backend/query_planner.py`
+- Spatial logic: `backend/spatial_engine.py`
+- RAG orchestrator: `backend/rag_pipeline.py`
+- Vector retrieval / embeddings: `backend/vector_engine.py`
+- Logging: no dedicated module currently exists
+
 ### Architecture Summary
 
 - `frontend/app.py`
-  - Streamlit UI
-  - Uses `pydeck`
-  - Renders only a heatmap + scatterplot company points
-  - Auto-starts the backend if needed
+  - Streamlit app
+  - uses `pydeck`
+  - renders point heatmap + point scatter
+  - no county GeoJSON layer
 
 - `backend/main.py`
   - FastAPI app
-  - Startup loads `HybridGeospatialRAGPipeline`
-  - `POST /chat` returns answer, sources, retrieved chunks/companies, plan, model
+  - loads a single `HybridGeospatialRAGPipeline` on startup
+  - exposes `/health` and `/chat`
 
 - `backend/ingestion.py`
-  - Loads Excel
-  - Parses city/county from text
-  - Enriches coordinates from the external lat/lon workbook
-  - Falls back to county centroids
-  - Writes `companies` and `company_chunks` to DuckDB
-  - Builds FAISS index and vector metadata
-
-- `backend/sql_engine.py`
-  - Simple DuckDB filters for OEM, industry, employment, and string search
+  - loads Excel company data
+  - loads external coordinate workbook
+  - parses city/county from text
+  - falls back to county centroid when coordinates are missing
+  - writes DuckDB + FAISS + vector metadata
 
 - `backend/spatial_engine.py`
-  - Loads company rows from DuckDB
-  - Builds city “centroids” from company point averages
-  - Loads county centroids from the GeoJSON
-  - Supports point-radius filtering only
+  - builds city “centroids” by averaging stored points
+  - builds county centroids from the GeoJSON
+  - answers point-radius queries only
 
-- `backend/vector_engine.py`
-  - Loads FAISS and vector metadata
-  - Uses sentence-transformers if available
-  - Silently falls back to hash embeddings otherwise
+- `backend/query_planner.py`
+  - heuristic parser for coordinates, radius, city, OEM, category, capability
+  - no explicit county intent or gap-query intent
 
 - `backend/rag_pipeline.py`
-  - Orchestrates planner + retrieval
-  - Builds retrieved chunks
-  - Calls Ollama through the OpenAI-compatible API
-  - Returns generic `[C1]`, `[C2]`-style citations
+  - merges SQL, vector, and geo retrieval
+  - builds generic retrieval chunks
+  - asks Ollama for final answer
+  - uses generic `[C1]`-style citations
 
-### Mapping Library
+- `backend/vector_engine.py`
+  - loads FAISS
+  - may use sentence-transformers
+  - silently falls back to hash mode if load fails
 
-- Library used: `pydeck` in `frontend/app.py`
-- Current layers:
+### Mapping Library and Recommendation
+
+Current library:
+
+- `pydeck`
+
+Current feasibility:
+
+- Polygon overlay: feasible
+- Hover tooltips: feasible
+- Reliable polygon click selection back into Python: not implemented and not dependable in this app as written
+
+Recommendation for `<300` points:
+
+- Keep `pydeck` if the default interaction is a **county dropdown**, which is your required reliable path.
+- Only pursue polygon-click selection if a dependable event bridge is introduced.
+- If reliable click selection becomes a hard requirement, `streamlit-folium` is the safer alternative for this app size.
+
+## B) Current Behavior by Subsystem
+
+### Frontend Map
+
+`frontend/app.py::render_map`
+
+- renders:
   - `HeatmapLayer`
   - `ScatterplotLayer`
-- No `GeoJsonLayer` or `PolygonLayer` is used
-- No polygon-selection path exists in the code
+- does not render:
+  - `GeoJsonLayer`
+  - `PolygonLayer`
+  - county dropdown
+  - county summary panel
+  - choropleth
 
-Note on interaction:
+### County Assignment
 
-- In this codebase, `st.pydeck_chart(...)` is used only for rendering and hover tooltips.
-- There is no implemented path for polygon click state to flow back into Python.
-- For Summit, a county dropdown is the safest immediate interaction model unless the app adopts a different map component or a custom event bridge.
+`backend/ingestion.py::attach_coordinates`
 
-### Where Company Data Is Loaded and County Info Is Assigned
+- current county is taken from:
+  - parsed `Location` text
+  - coordinate workbook columns
+- it is **not** computed via point-in-polygon
 
-- Excel load: `backend/ingestion.py::run_ingestion`
-- County parsing: `backend/ingestion.py::extract_city_county`
-- County assignment in stored rows:
-  - parsed from `Location`
-  - optionally overridden from coordinate workbook columns
-  - **not** computed from point-in-polygon
+### County Geometry
 
-### Where Geo Computations Happen
+`backend/ingestion.py::load_county_centroids`
 
-- County centroid extraction: `backend/ingestion.py::load_county_centroids`
-- Point-radius filtering: `backend/spatial_engine.py::companies_within_radius`
-- “Near city/county” resolution:
-  - `backend/spatial_engine.py::_resolve_city_coordinates`
-  - `backend/spatial_engine.py::companies_near_city`
+- reduces each county polygon to an average-of-vertices point
 
-### Where Retrieval / LLM Integration Happens
+`backend/spatial_engine.py::companies_near_city`
 
-- Planner: `backend/query_planner.py::plan`
-- SQL retrieval: `backend/sql_engine.py`
-- Vector retrieval: `backend/vector_engine.py::semantic_company_search`
-- Geo retrieval merge/orchestration: `backend/rag_pipeline.py::answer_question`
-- Context assembly: `backend/rag_pipeline.py::_build_retrieved_chunks` and `_format_context`
-- Citation formatting: `backend/rag_pipeline.py::_chunk_source_line`
-- LLM call: `backend/rag_pipeline.py::_generate_answer_with_llm`
+- resolves county-like queries to a centroid point and then applies point-radius filtering
 
-## Key Runtime Findings
+That violates your non-negotiable definition of county distance.
 
-### 1) The shipped map is not a GeoJSON county map
+### Point Radius Queries
 
-`frontend/app.py::render_map` renders only company points and a heatmap. The county GeoJSON file is never loaded in the UI. This means the app is not currently a visible GeoJSON polygon viewer.
+`backend/spatial_engine.py::companies_within_radius`
 
-### 2) County geometry is reduced to centroids
+- uses `geopy.distance`
+- this is directionally correct for point-radius queries
+- but the stored company coordinates are currently unreliable
 
-`backend/ingestion.py::load_county_centroids` converts each county polygon into the mean of all polygon vertices. `backend/spatial_engine.py` then uses these centroids to answer county-like proximity queries.
+### Query Routing
 
-That is not acceptable for:
+`backend/query_planner.py::plan`
 
-- “companies in county X”
-- “within N miles of county X”
-- county gap analysis
+- route types currently returned:
+  - `SQL_QUERY`
+  - `GEO_QUERY`
+  - `VECTOR_QUERY`
+  - `HYBRID_QUERY`
 
-### 3) Query planner does not support county semantics correctly
+Missing route transparency:
 
-Observed planner outputs:
+- no explicit `lookup`
+- no explicit `analytic_local`
+- no explicit `web_needed`
 
-- `"show companies in Fulton County"` -> `VECTOR_QUERY`, no geo hint
-- `"within 50 miles of Fulton County"` -> `GEO_QUERY` with `city='Fulton County'`
-- `"which counties have 0 battery companies"` -> `HYBRID_QUERY` with `capability_term='battery'`, not a county-zero analytic
+### Evidence and Citations
 
-This means requirement A and D are not implemented as explicit geo/analytic intents.
+`backend/rag_pipeline.py`
 
-### 4) Coordinate integrity is the largest correctness risk
+- builds generic chunk ids `C1`, `C2`, ...
+- prompts the LLM to cite chunk ids like `[C3]`
+- does not emit:
+  - `DOC:...`
+  - `GEO:...`
+  - `ANALYTIC:...`
+- does not perform post-generation citation validation
 
-Observed from `gnem.duckdb`:
+## C) Requirements Checklist
 
-- 207 company rows total
-- 202 rows use the external coordinate workbook
-- 4 rows use county centroid fallback
-- 1 row is still missing coordinates
+| # | Requirement | Status | Evidence | Assessment |
+| --- | --- | --- | --- | --- |
+| 1 | County polygon overlay visible on map | MISSING | `frontend/app.py::render_map` | No county GeoJSON layer is rendered. |
+| 2 | Company point layer visible with tooltips (`name`, `role/category`, `county`, `lat/lon`) | PARTIAL | `frontend/app.py::render_map` | Points and tooltips exist, but tooltips omit explicit `lat/lon` and do not clearly expose role/category + county in the required format. |
+| 3 | Choropleth shading by county counts | MISSING | no implementation found | No county aggregation + polygon fill path exists. |
+| 4 | County selection interaction (`dropdown` required) | MISSING | `frontend/app.py` sidebar + map | No county dropdown and no county-selection state. |
+| 5 | Correct county assignment (point-in-polygon from GeoJSON) | MISSING | `backend/ingestion.py::attach_coordinates` | County is text/workbook-derived, not geometry-derived. |
+| 6 | Correct “within X miles of county” using point-to-polygon minimum distance in projected CRS | MISSING | `backend/ingestion.py::load_county_centroids`, `backend/spatial_engine.py::companies_near_city` | County queries use centroid points, not polygon boundary distance and not projected CRS distance. |
+| 7 | Correct “within X miles of point” (haversine/geodesic) | PARTIAL | `backend/spatial_engine.py::companies_within_radius` | Uses `geopy.distance`, but point correctness is undermined by unvalidated coordinates. |
+| 8 | Derived analytic summaries exist (county counts, role distribution, zero-count gaps) | MISSING | no analytic engine/table found | No deterministic county analytic tables exist. |
+| 9 | Geo-aware RAG routing exists and is transparent (`lookup`, `analytic_local`, `web_needed`) | MISSING | `backend/query_planner.py::plan`, `backend/rag_pipeline.py::answer_question` | Current routing is heuristic and opaque; no explicit route taxonomy or auditability. |
+| 10 | Strict evidence IDs `DOC:`, `GEO:`, `ANALYTIC:` | MISSING | `backend/rag_pipeline.py::_build_retrieved_chunks`, `_generate_answer_with_llm` | Generic `[C1]` ids are used instead of stable evidence namespaces. |
+| 11 | Reproducibility: pinned deps + deterministic embedding loading, no silent fallback | MISSING | `requirements.txt`, `backend/ingestion.py::create_embeddings`, `backend/vector_engine.py::_init_embedder` | Dependencies are unpinned and embedding fallback is silent. |
+| 12 | Minimal pytest suite exists | MISSING | no `tests/` directory | No automated tests. |
+| 13 | JSONL logging exists | MISSING | `backend/main.py` | No structured query/result/evidence logging exists. |
 
-Observed from `vector_metadata.json` and DuckDB probes:
+## D) Why the Current Implementation Fails the Intended Requirements
 
-- The current built artifact stores many exact workbook coordinates that are inconsistent with the labeled location/county.
+### 1. It is not yet a true GeoJSON county map
 
-Concrete examples from `GNEM - Auto Landscape Lat Long Updated File (1).xlsx`:
+The codebase loads a county GeoJSON file during ingestion, but the frontend never displays those polygons. The user sees point blobs, not counties.
 
-- `ACM Georgia LLC`
-  - labeled location: `Calhoun, Gordon County`
-  - address: `975 Thomson Hwy, Warrenton, GA 30828`
-- `Adient`
-  - labeled location: `Ringgold, Catoosa County`
-  - address: `1700 S Progress Pkwy, West Point, GA 31833`
-- `Elan Technology Inc.`
-  - labeled location: `Atlanta, Fulton County`
-  - address: `169 Elan Court, Midway, GA 31320`
-- `Michelin Tread Technologies`
-  - labeled location: `Lawrenceville, Gwinnett County`
-  - address: `1 Parkway South Blvd, Greenville, SC 29615`
+### 2. County math is currently geometry-wrong
 
-Polygon validation against `Counties_Georgia.geojson` found:
+The code uses county centroids, and those centroids are not even proper polygon centroids. They are averages of vertices. That is unacceptable for:
 
-- `9` company points lie outside **all** Georgia county polygons
-- `167` of `183` rows that have both a county label and coordinates do **not** fall inside their labeled county polygon
+- county containment
+- county-distance queries
+- county gap analytics
 
-That is a Summit-blocking geo correctness issue.
+### 3. Coordinate integrity is not enforced
 
-### 5) City anchors are not true city anchors
+This is the biggest professor-risk in the repository. If points are not validated before indexing and display, the map, retrieval, and RAG outputs are all vulnerable to invalid geographic claims.
 
-`backend/spatial_engine.py::_build_city_centroids` averages company coordinates by city label. That means a query like “near Atlanta” uses the mean of stored company points labeled Atlanta, not a city boundary, city center, or authoritative gazetteer.
+### 4. County and gap queries are being answered with the wrong machinery
 
-Runtime probe examples:
+Questions like:
 
-- `Atlanta -> (33.4244, -84.1040)`
-- `Savannah -> (32.4205, -83.5304)`
+- `show companies in Fulton County`
+- `within 50 miles of Fulton County`
+- `which counties have 0 battery companies`
 
-The Savannah anchor is especially revealing: it is materially inland and not a defensible “Savannah” anchor.
+should be routed to:
 
-### 6) Embedding pipeline is not research-grade reproducible
+- deterministic geometry lookup
+- deterministic local analytics
 
-The current artifact reports:
+They should not be left to heuristic semantic retrieval plus LLM narration.
 
-- `embedding_backend: hash-fallback`
-- `embedding_model: hashed-token-384`
+### 5. The retrieval and citation layer is not geo-transparent
 
-That means the shipped vector index is not using a semantic embedding model at all.
+The current evidence layer tells the model “cite `[C3]`,” but professor-defensible geo/RAG systems need citations that disclose whether the supporting fact came from:
 
-The code also has two reproducibility problems:
+- a source document
+- a polygon computation
+- a deterministic analytic table
 
-- `backend/ingestion.py::create_embeddings`
-  - defaults to hash fallback unless `EMBEDDING_BACKEND` is explicitly set
-- `backend/vector_engine.py::_init_embedder`
-  - silently falls back to hash query embeddings if the sentence-transformer cannot load
+## E) Prioritized Change Plan
 
-That silent runtime fallback is dangerous because it can produce **index/query embedding mismatch** if the FAISS index was built with one backend and queries are embedded with another.
+## P0: Summit-Blocking Correctness
 
-## B) Requirements Checklist
+### P0.0 Add the geo correctness gate first
 
-| Requirement | Status | Evidence | Assessment |
-| --- | --- | --- | --- |
-| 1. County polygon overlay visible on map | MISSING | `frontend/app.py::render_map` | Only `HeatmapLayer` + `ScatterplotLayer`; no GeoJSON polygon layer is rendered. |
-| 2. Company point layer visible with tooltips | MET | `frontend/app.py::render_map` | Company points are visible, pickable, and include tooltips. |
-| 3. Choropleth shading by county counts | MISSING | no implementation found | No county aggregation and no polygon fill logic exist. |
-| 4. County selection interaction (dropdown and/or polygon click) | MISSING | `frontend/app.py` sidebar + map | No county dropdown, no polygon click handling, no county highlight workflow. |
-| 5. Correct county assignment (point-in-polygon) from GeoJSON | MISSING | `backend/ingestion.py::attach_coordinates` | County is parsed from text/workbook columns, not geometry. No spatial join is performed. |
-| 6. Correct distance-to-county queries (min distance to polygon boundary) | MISSING | `backend/ingestion.py::load_county_centroids`, `backend/spatial_engine.py::companies_near_city` | County queries are routed through centroid-like points, not polygon boundary distance. |
-| 7. Correct radius-from-point queries (haversine/geodesic) | PARTIALLY MET | `backend/spatial_engine.py::companies_within_radius` | Uses `geopy.distance`, but the underlying stored company coordinates are often invalid. |
-| 8. Derived analytic summaries available (county counts, role distribution, gaps) | MISSING | no analytic table/module found | No deterministic county analytics or zero-count gap tables exist. |
-| 9. Evidence-backed answers with strict citation format for geo evidence | PARTIALLY MET | `backend/rag_pipeline.py::_build_retrieved_chunks`, `_chunk_source_line`, `_generate_answer_with_llm` | Generic `[C1]` citations exist, but there is no stable `[GEO:...]` scheme, no geo evidence contract, and no bullet-level geo citation enforcement. |
-| 10. Reproducibility: pinned dependencies + deterministic embedding model loading | MISSING | `requirements.txt`, `backend/ingestion.py::create_embeddings`, `backend/vector_engine.py::_init_embedder` | Dependencies are unpinned; embedding fallback is hash-based and silent. |
-| 11. Minimal test suite present (pytest) | MISSING | no `tests/` directory or `pytest` use found | There are no automated tests. |
-| 12. Logging of user queries and outputs (JSONL preferred) | MISSING | `backend/main.py` | No structured query/result logging exists. |
-
-## C) What Is Missing / Incorrect / Fragile / Non-Reproducible
-
-### P0 Correctness Problems
-
-1. **The app is not visibly using GeoJSON polygons in the map UI.**
-   - This alone means the current UI does not satisfy the “GeoJSON + map view” requirement as stated.
-
-2. **County semantics are geometry-wrong.**
-   - County queries use centroids, not polygons.
-   - Distance-to-county is point-to-centroid, not point-to-polygon-boundary.
-
-3. **County assignment is text-based, not geometric.**
-   - The stored `county` field is not validated against coordinates.
-
-4. **Coordinate quality is poor enough to invalidate many geo results.**
-   - 9 points outside all Georgia counties
-   - 167/183 county-labeled points outside their labeled county polygon
-
-5. **City anchors are derived from noisy company averages.**
-   - “near Atlanta” and “near Savannah” are not anchored to authoritative city geometry or even stable city centers.
-
-### P1 Fragility / Reproducibility Problems
-
-6. **The retrieval stack is not truly deterministic in a research sense.**
-   - Unpinned dependencies
-   - Embedding backend changes based on environment
-   - Silent runtime fallback behavior
-
-7. **The shipped vector index is currently hash-based.**
-   - That is deterministic, but semantically weak and inconsistent with the expected FAISS + sentence-transformers story.
-
-8. **Nominatim geocoder fallback introduces network dependence.**
-   - `backend/spatial_engine.py::_resolve_city_coordinates` can call a live external geocoder.
-   - That is non-reproducible and unsuitable for a research demo pipeline.
-
-9. **Generic per-query chunk IDs are not stable citations.**
-   - `C1`, `C2`, ... depend on retrieval order and are not durable evidence identifiers.
-
-10. **No tests, no logs, no experiment record.**
-   - This makes professor-level scrutiny difficult to answer.
-
-## D) Prioritized Correction Plan
-
-## P0: Must Fix Before Summit / Professor Review
-
-### P0.1 Replace centroid county logic with polygon-aware geometry
+This must begin with a coordinate-join audit, not immediate quarantine.
 
 - What to change:
-  - Implement true county polygon loading and geometry operations.
+  - Audit the coordinate join, then validate every point against the county GeoJSON before it can enter the system.
+- Where:
+  - `backend/ingestion.py`
+- Why:
+  - This is your non-negotiable correctness gate.
+- How:
+  - First, write a join audit:
+    - join key used
+    - exact-match rate
+    - duplicate key count
+    - examples of bad company/address/coordinate pairings
+  - Load county polygons
+  - Compute `computed_county` by point-in-polygon
+  - If point is outside Georgia or not assignable, quarantine it
+  - If `county` mismatches `computed_county`, log it
+  - Write:
+    - `geo_validation_report.csv`
+    - mismatch-rate summary
+  - Enforce fail-fast thresholds:
+    - `outside_ga_rate > 1%` -> fail ingestion
+    - `county_mismatch_rate > 5%` to `10%` -> fail ingestion
+  - Exclude quarantined rows from DuckDB, FAISS, and UI payloads
+
+### P0.1 Add county GeoJSON overlay and county dropdown
+
+- What to change:
+  - Add county polygons, county tooltip counts, and county dropdown.
+- Where:
+  - `frontend/app.py`
+- Why:
+  - This is the required map interaction surface and the safest selection mode.
+- How:
+  - Load `Counties_Georgia.geojson` into the frontend
+  - Add a county dropdown in the sidebar
+  - Highlight the selected county polygon
+  - Add county tooltips:
+    - county name
+    - filtered company count
+    - total company count
+    - role/category stats
+  - Keep polygon click optional
+
+### P0.2 Replace centroid county logic with polygon-aware spatial operations
+
+- What to change:
+  - Replace county centroid logic entirely for county containment and county distance.
 - Where:
   - `backend/spatial_engine.py`
   - `backend/query_planner.py`
   - `backend/rag_pipeline.py`
-- Why it matters:
-  - This is the core requirement for county-aware RAG.
-  - Current centroid logic is not defensible for county distance or containment questions.
-- How to implement:
-  - Add `shapely` and `pyproj`
-  - Load county polygons once from `Counties_Georgia.geojson`
-  - Store:
-    - county polygon geometry
-    - county display properties
-  - Add functions:
+- Why:
+  - The current approach is not geometrically valid.
+- How:
+  - Load county polygons once using `shapely`
+  - Project points and polygons to a projected CRS in meters before county-distance calculations
+  - Standardize on `EPSG:5070` for statewide distance math
+  - Use the same CRS in code, tests, logs, and evidence payloads
+  - Implement:
     - `companies_in_county(county_name)`
-    - `companies_within_distance_of_county(county_name, radius_miles)`
-    - `companies_within_distance_of_point(lat, lon, radius_miles)`
-    - `counties_with_zero_companies(filters)`
-  - Use:
-    - point-in-polygon for county inclusion
-    - polygon-to-point minimum distance for “within N miles of county X”
-  - Keep centroid only as a clearly labeled fallback when coordinates are missing.
+    - `companies_within_miles_of_county(county_name, miles)`
+    - `companies_within_miles_of_point(lat, lon, miles)`
+  - County distance definition:
+    - minimum point-to-polygon distance in projected meters
+    - convert meters to miles
+    - distance is `0` if the point lies inside the polygon
 
-### P0.2 Validate coordinates during ingestion and quarantine bad rows
-
-- What to change:
-  - Add ingestion-time geo validation against the county polygons.
-- Where:
-  - `backend/ingestion.py::attach_coordinates`
-  - `backend/ingestion.py::run_ingestion`
-  - data workbook curation process
-- Why it matters:
-  - Right now the map and geo retrieval are operating on many invalid coordinates.
-- How to implement:
-  - Load county polygons during ingestion
-  - For each row with coordinates:
-    - verify point is inside Georgia
-    - if county is known, verify point is inside labeled county
-  - Add columns:
-    - `geo_validation_status`
-    - `validated_county`
-    - `geo_validation_note`
-  - Write a validation artifact such as `data/geo_validation_report.jsonl`
-  - Fail ingestion if invalid-rate exceeds a threshold
-  - Review and repair the external coordinate workbook before rebuilding artifacts
-
-### P0.3 Add visible GeoJSON polygon overlay and county-focused UI
+### P0.3 Extend planner to parse county and gap intents explicitly
 
 - What to change:
-  - Render county polygons on the map and expose county selection.
+  - Add explicit parsing for county lookup, county-distance, and gap analytics.
 - Where:
-  - `frontend/app.py`
-- Why it matters:
-  - The current UI is a point map, not a county GeoJSON map.
-- How to implement:
-  - Load `Counties_Georgia.geojson` in the frontend
-  - Add a `GeoJsonLayer` or `PolygonLayer`
-  - Add county tooltip fields:
-    - county name
-    - total company count
-    - filtered company count
-    - role/category count
-  - Add a sidebar county dropdown immediately
-  - Highlight selected county polygon
-  - Add optional choropleth fill based on company counts
+  - `backend/query_planner.py`
+- Why:
+  - Current planner misroutes county and gap questions.
+- How:
+  - Add support for:
+    - `in <county>`
+    - `within <N> miles of <county>`
+    - `counties with 0 <role/category>`
+  - Produce explicit route tags:
+    - `lookup`
+    - `analytic_local`
+    - `llm_synthesis`
+    - `web_needed`
+  - Add structured hints:
+    - `target_county`
+    - `radius_miles`
+    - `geo_anchor_type`
+    - `analytic_metric`
 
-### P0.4 Implement deterministic county analytics for gaps and density
+### P0.4 Route county/gap questions to deterministic local paths
 
 - What to change:
-  - Add an analytic layer instead of trying to answer county gap queries via semantic retrieval.
+  - Do not answer county analytics via semantic search alone.
 - Where:
-  - New module recommended: `backend/analytics_engine.py`
-  - Or extend `backend/sql_engine.py` plus `backend/rag_pipeline.py`
-- Why it matters:
-  - “Which counties have 0 battery companies?” is an analytic query, not a vector retrieval question.
-- How to implement:
-  - Build deterministic county summary tables:
-    - `county_company_counts`
-    - `county_role_counts`
-    - `county_category_counts`
-  - Join company points to county polygons
-  - Materialize per-county counts in DuckDB during ingestion
-  - Add pipeline support for:
-    - top counties by count
-    - zero-count counties
-    - density by county
-    - role/category distribution
+  - `backend/rag_pipeline.py`
+  - recommended new module: `backend/analytics_engine.py`
+- Why:
+  - County queries are local analytic/geometry tasks.
+- How:
+  - Route:
+    - county membership -> geometry lookup
+    - county distance -> geometry lookup
+    - zero-count gap -> deterministic analytic table
+  - Reserve `llm_synthesis` only for narration over already-computed deterministic evidence
+  - Never let the LLM invent the county set, gap set, or county-distance result
 
-### P0.5 Enforce stable geo citations
+### P0.5 Replace generic citations with stable evidence IDs
 
 - What to change:
-  - Replace generic query-local `C1` citations with stable geo/doc identifiers.
+  - Introduce stable evidence namespaces.
 - Where:
-  - `backend/rag_pipeline.py::_build_retrieved_chunks`
-  - `backend/rag_pipeline.py::_format_context`
-  - `backend/rag_pipeline.py::_chunk_source_line`
-  - LLM prompt in `backend/rag_pipeline.py::_generate_answer_with_llm`
-- Why it matters:
-  - Professor-level scrutiny will ask what exact evidence supports the geo answer.
-- How to implement:
-  - Emit stable IDs such as:
+  - `backend/rag_pipeline.py`
+- Why:
+  - Generic `[C1]` ids are not stable or audit-friendly.
+- How:
+  - Emit:
     - `DOC:<chunk_id>`
-    - `GEO:county=<county>:company=<slug>`
-    - `ANALYTIC:county=<county>:metric=<metric>`
-  - For geo answers, require at least one `GEO:` or `ANALYTIC:` citation
-  - Prefer bullet-level evidence statements with one citation per bullet
+    - `GEO:within_miles_of_county|county=<county>|company=<slug>|dist_mi=<value>|crs=EPSG:5070`
+    - `ANALYTIC:<table>|<county>|<metric>`
+  - Carry these ids into:
+    - retrieved chunk records
+    - answer prompt
+    - UI evidence panel
 
-## P1: Reproducibility / Research-Grade Hardening
+### P0.6 Add post-generation citation validation
 
-### P1.1 Pin dependencies and record runtime versions
+- What to change:
+  - Validate every non-abstaining bullet in the final answer.
+- Where:
+  - `backend/rag_pipeline.py`
+- Why:
+  - Geo/RAG answers must not ship uncited claims.
+- How:
+  - After generation:
+    - parse bullets
+    - require citation tokens on each non-abstaining bullet
+    - allowed tokens:
+      - `[DOC:...]`
+      - `[GEO:...]`
+      - `[ANALYTIC:...]`
+  - If validation fails:
+    - force abstention
+    - or replace with a deterministic fallback summary
+
+## P1: Reproducibility + Rigor
+
+### P1.1 Materialize county analytics tables in DuckDB
+
+- What to change:
+  - Add deterministic county-level summary tables.
+- Where:
+  - `backend/ingestion.py`
+  - new `backend/analytics_engine.py`
+  - DuckDB output
+- Required tables:
+  - company count per county
+  - role distribution per county
+  - category distribution per county
+  - zero-count gap-support tables
+
+### P1.2 Pin dependencies and add geometry/test packages
 
 - What to change:
   - Replace loose requirements with pinned versions.
 - Where:
   - `requirements.txt`
-  - add lockfile such as `requirements-lock.txt`
-- Why it matters:
-  - Current installs are non-reproducible.
-- How to implement:
-  - Pin every package version
-  - Record Python version in README
-  - Add `shapely`, `pyproj`, and `pytest`
-  - Consider a compiled lock via `pip-compile`
+  - optional lockfile
+- Add:
+  - `shapely`
+  - `pyproj`
+  - `geopandas` if preferred
+  - `pytest`
+  - `streamlit-folium` only if click interaction becomes necessary
 
-### P1.2 Remove silent embedding fallbacks
+### P1.3 Remove silent embedding fallback
 
 - What to change:
-  - Make embedding backend explicit and fail-fast.
+  - Make embedding backend explicit and consistent between ingestion and query time.
 - Where:
   - `backend/ingestion.py::create_embeddings`
   - `backend/vector_engine.py::_init_embedder`
-- Why it matters:
-  - Silent fallback can produce invalid retrieval behavior and undermines reproducibility.
-- How to implement:
-  - Require explicit `EMBEDDING_BACKEND`
-  - Default to sentence-transformers, not hash
-  - If configured model is unavailable, fail ingestion/startup unless an explicit override is set
-  - Log embedding backend/model into startup and query logs
+- Why:
+  - Silent embedding fallback undermines reproducibility and can create invalid index/query mixtures.
+- How:
+  - Fail fast if the configured embedding backend is unavailable
+  - Or explicitly choose a deterministic fallback mode and rebuild the entire index consistently
+  - Never silently mix backends
 
-### P1.3 Remove live geocoder fallback from production path
+### P1.4 Remove live Nominatim fallback
 
 - What to change:
-  - Eliminate runtime `Nominatim` dependency.
+  - Delete runtime geocoder dependence.
 - Where:
   - `backend/spatial_engine.py::_resolve_city_coordinates`
-- Why it matters:
-  - Network calls make results non-reproducible.
-- How to implement:
-  - Replace with local gazetteer or fixed county/city anchor table
-  - Restrict supported anchor types to:
-    - county polygon
-    - county centroid fallback
-    - explicit point
-    - curated city centroid table
+- Why:
+  - It is not reproducible and not necessary for the stated county-first workflow.
 
-### P1.4 Add minimal pytest suite
+### P1.5 Add minimal pytest suite
 
 - What to change:
-  - Add a `tests/` directory with at least five tests.
-- Where:
-  - new `tests/` package
-- Why it matters:
-  - There is currently zero automated assurance.
-- Minimum tests:
-  1. GeoJSON polygon load + county lookup
-  2. Point-in-polygon county assignment
-  3. Distance-to-county uses polygon boundary, not centroid
-  4. Point-radius query returns expected companies
-  5. Geo/county gap analytic returns zero-count counties deterministically
-  6. Geo answers require stable geo citations
+  - Add a `tests/` directory with at least five cases.
+- Required tests:
+  1. parse radius + county intent correctly
+  2. point-in-polygon assigns expected county for a known test point
+  3. polygon-distance query works for a boundary-near point
+  4. gap analytics returns deterministic output for a known role/category
+  5. citation enforcement rejects an uncited bullet
 
-### P1.5 Add JSONL logging
+### P1.6 Add JSONL logging
 
 - What to change:
-  - Log queries, plan, retrieval summary, answer, model, and embedding backend.
+  - Add structured per-request logs.
 - Where:
   - `backend/main.py`
   - recommended new helper: `backend/logging_utils.py`
-- Why it matters:
-  - Needed for reproducibility, debugging, and demo postmortems.
-- How to implement:
-  - Append one JSON object per request to `logs/chat_runs.jsonl`
-  - Include:
-    - timestamp
-    - question
-    - plan
-    - model
-    - embedding backend/model
-    - retrieved company ids
-    - citations returned
-    - errors if any
+- Required fields:
+  - timestamp
+  - query
+  - route/plan
+  - selected county / radius / anchor
+  - evidence ids
+  - retrieval summary
+  - model
+  - embedding backend
+  - answer
+  - errors
 
-## P2: Demo Polish / UX Hardening
+### P1.7 Add a deterministic geo “truth slice” for evaluation
 
-### P2.1 Add county choropleth and summary panel
+- What to change:
+  - Create a small evaluation slice where correctness can be claimed without web lookup.
+- Why:
+  - This is the most defensible research-grade accuracy story for the geo subsystem.
+- Include:
+  - county assignment via point-in-polygon
+  - within-X-miles-of-county via polygon distance in `EPSG:5070`
+  - zero-count county gap queries
+- Use this slice for:
+  - before/after coordinate-join audit comparisons
+  - centroid-vs-polygon ablations
+  - citation-validator ablations
+
+## P2: Polish
+
+### P2.1 Add choropleth shading and county summary side panel
 
 - Where:
   - `frontend/app.py`
-- Why:
-  - Makes county gaps and density instantly visible during Summit demo.
 
-### P2.2 Add explicit “geo method” disclosure in UI
+### P2.2 Surface geo method choice in the UI
 
 - Where:
   - `frontend/app.py`
-- Why:
-  - Helpful for professor questions.
 - Show:
-  - “county containment = polygon”
-  - “county distance = min point-to-polygon distance”
-  - “point radius = geodesic distance”
+  - polygon containment
+  - polygon-distance in projected CRS
+  - geodesic point-radius
 
-### P2.3 Improve backend startup/debugging UX
+### P2.3 Improve backend startup diagnostics
 
 - Where:
   - `frontend/app.py`
 - Why:
-  - Current auto-start hides stdout/stderr, which slows diagnosis during demos.
+  - Current auto-start swallows backend stdout/stderr
 
-## Concrete File/Function Edit Targets
+## F) File / Function Edit Targets
 
-### Highest-value edits
+### Core edit list
 
-- `frontend/app.py::render_map`
-  - add county GeoJSON layer, selected county highlight, choropleth
+- `backend/ingestion.py`
+  - `attach_coordinates`
+  - `run_ingestion`
+  - add geo validation + quarantine + report generation
 
 - `backend/spatial_engine.py`
-  - replace centroid-only county logic with polygon operations
+  - replace centroid logic
+  - add polygon containment and projected-CRS county distance
   - remove live geocoder fallback
 
-- `backend/query_planner.py::plan`
-  - add explicit parsing for:
-    - `in <county>`
-    - `within N miles of <county>`
-    - `within N miles of <lat, lon>`
-    - `which counties have 0 ...`
+- `backend/query_planner.py`
+  - add county intent parser
+  - add gap-query parser
+  - add route transparency fields
 
-- `backend/rag_pipeline.py::answer_question`
-  - route county and gap queries to deterministic geo/analytic functions
+- `backend/rag_pipeline.py`
+  - add deterministic route handling
+  - add geo/doc/analytic evidence ids
+  - add citation validator
 
-- `backend/rag_pipeline.py::_build_retrieved_chunks`
-  - emit stable `GEO:` and `ANALYTIC:` evidence ids
-
-- `backend/ingestion.py::attach_coordinates`
-  - validate coordinates against county polygons
-  - stop accepting invalid rows silently
-
-- `backend/ingestion.py::create_embeddings`
-  - fail-fast on embedding model issues unless explicitly overridden
-
-- `backend/vector_engine.py::_init_embedder`
-  - remove silent runtime hash fallback
+- `frontend/app.py`
+  - add county dropdown
+  - add county polygon layer
+  - add county summary panel
+  - add tooltip lat/lon
 
 - `requirements.txt`
-  - pin versions and add geometry/test dependencies
+  - pin dependencies
+  - add geometry/test stack
 
-## Recommended Summit Demo Workflow
+- `backend/main.py`
+  - add JSONL logging hooks
 
-Use this flow once the P0 items are fixed:
+## G) Recommended Summit Demo Workflow
 
-1. Start on a county polygon map of Georgia
-   - county polygons visible
-   - choropleth = total supplier count
+Once P0 is complete, demo in this order:
 
-2. Select a county from a dropdown
-   - polygon highlights
-   - side panel shows:
-     - total companies
-     - top roles
-     - top OEM links
-
-3. Ask:
-   - “Show companies in Fulton County”
-   - map shows in-county points only
-   - response cites `GEO:` evidence items
-
+1. Select a county from a dropdown
+2. Show the highlighted GeoJSON county polygon
+3. Show company points inside that county with tooltips
 4. Ask:
-   - “Which battery suppliers are within 50 miles of Fulton County?”
-   - system uses polygon boundary distance
-   - response shows exact distance method and citations
-
+   - `show companies in Fulton County`
 5. Ask:
-   - “Which counties have 0 battery companies?”
-   - county gap choropleth highlights zero-count counties
-   - response cites deterministic `ANALYTIC:` evidence
-
-6. Open evidence panel
-   - show document citations
-   - show geo citations
-   - show analytics table row ids
+   - `which battery suppliers are within 50 miles of Fulton County`
+6. Ask:
+   - `which counties have 0 battery companies`
+7. Open evidence panel showing:
+   - `DOC:...`
+   - `GEO:...`
+   - `ANALYTIC:...`
+8. Show JSONL run log and geo validation report
 
 ## Final Assessment
 
 If judged as a prototype:
 
-- the project is coherent and promising
+- promising
 
-If judged as a geometry-correct, research-grade geospatial RAG system:
+If judged as a research-grade, geometry-correct, GeoJSON county RAG system:
 
-- it is **not yet there**
+- **not yet acceptable**
 
-The biggest blockers are:
+The blocking reasons are:
 
-1. no visible county polygon map
-2. centroid-based county reasoning
-3. coordinate integrity problems
-4. missing deterministic county analytics
-5. missing reproducibility discipline
-
-Those are all fixable, but they must be fixed before claiming that the system truly supports GeoJSON-based county reasoning.
+1. no county polygon map in the UI
+2. no point-in-polygon county assignment
+3. no projected-CRS point-to-polygon county distance
+4. no geo validation gate before indexing
+5. no deterministic county analytics
+6. no stable evidence ID scheme
+7. no reproducibility discipline
